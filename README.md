@@ -1,22 +1,19 @@
-# Indian Stock Intelligence V1
+# Indian Stock Intelligence V2
 
-A free, beginner-friendly Streamlit prototype for Indian equity research.
+A beginner-friendly Streamlit prototype for Indian stock research.
 
-## Run locally
+## V2 modules
+- 5-year technical engine
+- Annual + quarterly income statement, balance sheet and cash flow
+- Fundamental scoring
+- Relative valuation scoring
+- Quality/red-flag engine
+- Recent news/evidence
+- Risk-based position sizing
+- Long Term / Swing / Intraday objective score
 
-1. Install Python 3.11+.
-2. Open a terminal in this folder.
-3. Run:
-   `pip install -r requirements.txt`
-4. Run:
-   `streamlit run app.py`
+## Important limitation
+Management guidance, earnings-call commentary, order-book verification, promoter pledging, auditor issues, related-party transactions and DCF scenarios are NOT fabricated when the free structured-data layer cannot establish them.
 
-## Free cloud deployment
-
-Push these files to a GitHub repository and deploy the repository through Streamlit Community Cloud.
-
-## Scope
-
-V1 includes market price history, basic fundamentals exposed by the free data source, valuation fields, trend/momentum indicators, an illustrative risk-based position-sizing calculation, and a dashboard.
-
-Important: free data can be incomplete/delayed. Verify material investment decisions against primary NSE/BSE/company disclosures.
+## Deployment
+Upload `app.py` and `requirements.txt` to the root of the GitHub repository used by Streamlit Community Cloud.
