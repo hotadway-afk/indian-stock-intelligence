@@ -8,14 +8,14 @@ import yfinance as yf
 from datetime import datetime
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V2.4",
+    page_title="Indian Stock Intelligence V2.5",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ============================================================
-# V2.4: Exchange-first market-data architecture
+# V2.5: Exchange-first market-data architecture
 # NSE + BSE + NSE Emerge + BSE SME security resolver
 # Market-data priority: NSE/BSE exchange data -> optional yfinance fallback.
 # Coverage targets:
@@ -169,6 +169,59 @@ def _normalise_bse_rows(rows,group):
     bad=out["symbol"].isin(["","NAN","NONE"])|out["symbol"].str.fullmatch(r"\d+",na=False); out.loc[bad,"symbol"]=out["bse_code"]
     return out[out["bse_code"].str.len()>=5].copy()
 
+def _bse_segment_from_group(group):
+    g=str(group or "").strip().upper()
+    if g in BSE_SME_GROUPS:
+        return "BSE SME"
+    if g:
+        return "BSE Main Board"
+    return "BSE / segment unverified"
+
+
+def _bse_exact_from_code(code):
+    """Resolve a BSE scrip directly, without requiring the bulk BSE universe to load."""
+    code=str(code or "").strip()
+    if not re.fullmatch(r"\d{5,6}", code):
+        return pd.DataFrame()
+    # Try the public BSE scrip endpoint first.
+    try:
+        p={"scripcode":code,"Group":"","industry":"","segment":"Equity","status":"Active"}
+        r=requests.get(f"{BSE_API}/ListofScripData/w",params=p,headers=REQUEST_HEADERS,timeout=15)
+        if r.ok:
+            payload=r.json(); rows=payload.get("Table",payload if isinstance(payload,list) else [])
+            n=_normalise_bse_rows(rows,"")
+            if not n.empty:
+                return n
+    except Exception:
+        pass
+    # Then use the quote/header endpoint, which can identify a valid scrip even
+    # when the bulk list endpoint is unavailable.
+    try:
+        r=requests.get(f"{BSE_API}/getScripHeaderData/w",params={"scripcode":code},headers=REQUEST_HEADERS,timeout=15)
+        if r.ok:
+            payload=r.json() if r.text else {}
+            h=payload.get("Header",{}) if isinstance(payload,dict) else {}
+            if isinstance(h,dict):
+                company=h.get("Scrip_Name") or h.get("ScripName") or h.get("CompanyName") or ""
+                symbol=h.get("ScripId") or h.get("Scrip_ID") or h.get("SecurityId") or ""
+                isin=h.get("ISIN") or h.get("ISIN_CODE") or ""
+                group=h.get("Group") or h.get("Scrip_Group") or h.get("GroupName") or ""
+                if company or symbol or isin:
+                    return pd.DataFrame([{
+                        "exchange":"BSE",
+                        "segment":_bse_segment_from_group(group),
+                        "symbol":str(symbol).strip().upper() or code,
+                        "company":str(company).strip(),
+                        "isin":str(isin).strip().upper(),
+                        "series":str(group).strip().upper(),
+                        "bse_code":code,
+                        "source":"BSE direct scrip/header resolver",
+                    }])
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_bse_universe():
     frames=[]
@@ -188,41 +241,46 @@ def load_bse_universe():
 
 @st.cache_data(ttl=900, show_spinner=False)
 def bse_peer_lookup(query):
+    """Best-effort BSE identity resolver independent of the bulk universe."""
     q=str(query).strip().upper()
     if not q: return pd.DataFrame()
+    # Numeric BSE code: direct resolution has priority.
+    if re.fullmatch(r"\d{5,6}", q):
+        direct=_bse_exact_from_code(q)
+        if not direct.empty: return direct
     try:
-        r=requests.get(f"{BSE_API}/PeerSmartSearch/w",params={"Type":"SS","text":q},headers=REQUEST_HEADERS,timeout=15); r.raise_for_status()
-        html=r.text.replace("&nbsp;"," "); codes=re.findall(r"(?<!\d)(\d{6})(?!\d)",html); isins=re.findall(r"\b(IN[A-Z0-9]{10,14})\b",html)
-        code=codes[0] if codes else ""; isin=isins[0].upper() if isins else ""
-        if not code: return pd.DataFrame()
-        symbol=""; m=re.search(r"<(?:strong|b)>\s*([A-Z0-9.&_-]{2,30})\s*</(?:strong|b)>",html,re.I)
-        if m: symbol=m.group(1).strip().upper()
-        company=q
-        segment="BSE Main Board"
-        group=""
-        # First enrich from the exact BSE scrip record. This also lets the
-        # fallback classify a newly listed SME security without depending on
-        # the large cached universe having loaded successfully.
-        try:
-            p={"scripcode":code,"Group":"","industry":"","segment":"Equity","status":"Active"}
-            payload=requests.get(f"{BSE_API}/ListofScripData/w",params=p,headers=REQUEST_HEADERS,timeout=12).json()
-            rows=payload.get("Table",payload if isinstance(payload,list) else [])
-            exact=_normalise_bse_rows(rows,"")
-            if not exact.empty:
-                row=exact.iloc[0].to_dict()
-                company=row.get("company") or company
-                symbol=row.get("symbol") or symbol
-                isin=row.get("isin") or isin
-                group=row.get("group") or group
-                segment=row.get("segment") or segment
-        except Exception: pass
-        try:
-            h=requests.get(f"{BSE_API}/getScripHeaderData/w",params={"scripcode":code},headers=REQUEST_HEADERS,timeout=10).json().get("Header",{})
-            company=h.get("Scrip_Name") or h.get("ScripName") or h.get("CompanyName") or company
-            symbol=h.get("ScripId") or h.get("Scrip_ID") or h.get("SecurityId") or symbol
-        except Exception: pass
-        return pd.DataFrame([{"exchange":"BSE","segment":segment,"symbol":str(symbol or q).upper(),"company":str(company).strip(),"isin":isin,"series":group,"bse_code":code,"source":"BSE PeerSmartSearch + exact scrip fallback"}])
-    except Exception: return pd.DataFrame()
+        r=requests.get(f"{BSE_API}/PeerSmartSearch/w",params={"Type":"SS","text":q},headers=REQUEST_HEADERS,timeout=15)
+        r.raise_for_status()
+        html=r.text.replace("&nbsp;"," ")
+        codes=re.findall(r"(?<!\d)(\d{5,6})(?!\d)",html)
+        isins=re.findall(r"\b(IN[A-Z0-9]{10,14})\b",html)
+        code=codes[0] if codes else ""
+        isin=isins[0].upper() if isins else ""
+        if not code and not isin: return pd.DataFrame()
+        # Enrich with exact scrip data whenever a code was found.
+        if code:
+            direct=_bse_exact_from_code(code)
+            if not direct.empty:
+                row=direct.iloc[0].to_dict()
+                if isin and not row.get("isin"): row["isin"]=isin
+                return pd.DataFrame([row])
+        symbol=""
+        for pattern in [r"<strong>\s*([A-Z0-9.&_-]{2,30})\s*</strong>",r"<b>\s*([A-Z0-9.&_-]{2,30})\s*</b>"]:
+            m=re.search(pattern,html,re.I)
+            if m:
+                symbol=m.group(1).strip().upper(); break
+        return pd.DataFrame([{
+            "exchange":"BSE",
+            "segment":"BSE / segment unverified",
+            "symbol":symbol or q,
+            "company":q,
+            "isin":isin,
+            "series":"",
+            "bse_code":code,
+            "source":"BSE PeerSmartSearch identity fallback",
+        }])
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_universe():
@@ -250,18 +308,24 @@ def resolve_security(query,exchange_choice,universe):
         matches["_rank"]=(matches.search_symbol==q).astype(int)*100+(matches.search_symbol.str.startswith(q,na=False)).astype(int)*20+(matches.search_company.str.startswith(q,na=False)).astype(int)*10+(matches.search_bse==q).astype(int)*100+(matches.search_isin==q).astype(int)*100
         matches=matches.sort_values("_rank",ascending=False).drop(columns="_rank")
         return matches.iloc[0].to_dict(),matches.head(25)
+
+    # Critical V2.5 change: direct BSE resolution is attempted even when the
+    # bulk BSE universe is empty. This prevents provider/master failures from
+    # being misreported as "unlisted".
     if exchange_choice in ("All Exchanges","BSE","BSE SME"):
         fb=bse_peer_lookup(q)
         if not fb.empty:
-            if exchange_choice=="BSE SME":
-                # Direct lookup is used only as a fallback; segment classification is
-                # accepted only when the BSE group universe has classified it as SME.
-                fb=fb[fb.segment=="BSE SME"]
-            if not fb.empty: return fb.iloc[0].to_dict(),fb
+            row=fb.iloc[0].to_dict()
+            if exchange_choice=="BSE SME" and row.get("segment") not in ("BSE SME", "BSE / segment unverified"):
+                # Do not reject a valid BSE identity merely because the segment
+                # could not be classified by the public endpoint.
+                row["segment_note"]="BSE SME requested; group/segment could not be independently verified from the public resolver."
+            return row,fb
     return None,pd.DataFrame()
 
+
 def yahoo_ticker_for(sec):
-    """Legacy fallback ticker only. Exchange data is preferred in V2.4."""
+    """Legacy fallback ticker only. Exchange data is preferred in V2.5."""
     exchange = str(sec.get("exchange", "NSE")).upper()
     symbol = str(sec.get("symbol", "")).strip().upper()
     code = str(sec.get("bse_code", "")).strip()
@@ -383,7 +447,7 @@ def bse_quote(code):
         r.raise_for_status()
         h = r.json().get("Header", {})
         out = {k: safe_num(h.get(k)) for k in ["PrevClose", "Open", "High", "Low", "LTP"]}
-        for k in ["Scrip_Name", "ScripName", "CompanyName", "ScripId", "SecurityId", "ISIN"]:
+        for k in ["Scrip_Name", "ScripName", "CompanyName", "ScripId", "SecurityId", "ISIN", "Group", "Scrip_Group", "GroupName"]:
             if h.get(k): out[k] = h.get(k)
         return out
     except Exception:
@@ -443,7 +507,7 @@ def _clean_yf_history(hist):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(sec):
-    """V2.4 exchange-first data layer.
+    """V2.5 exchange-first data layer.
 
     Priority for OHLCV:
       1) NSE public historical API for NSE / NSE Emerge
@@ -693,14 +757,14 @@ def management_engine(sec, info):
         "confidence": "LOW — filing-level management evidence not ingested",
         "evidence": evidence,
         "guidance": "Not verified",
-        "note": "V2.4 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
+        "note": "V2.5 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
     }
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V2.4")
+st.title("📊 Indian Stock Intelligence — V2.5")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -712,10 +776,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V2.4 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V2.5 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.4 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.5 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -725,20 +789,21 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V2.4 coverage")
+    st.markdown("### V2.5 coverage")
     st.markdown("- NSE Main Board")
     st.markdown("- NSE Emerge / SME")
     st.markdown("- BSE Main Board — all active equity groups")
     st.markdown("- BSE SME — M / MT / MS / TS groups")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
     st.markdown("- Exchange data first (NSE/BSE); yfinance only as legacy fallback")
-    st.caption("Exchange-universe discovery is separate from market-data availability. A listed stock can exist in the universe even when a free third-party provider has incomplete history.")
+    st.caption("V2.5 separates exchange identity from provider coverage. BSE direct identity resolution is attempted even if the bulk BSE master endpoint is unavailable.")
     st.stop()
 
 try:
     sec, matches = resolve_security(stock, exchange_choice, universe)
     if sec is None:
-        st.error(f"Could not find '{stock}' in the selected exchange/segment universe.")
+        st.error(f"Could not resolve '{stock}' in the selected exchange/segment universe.")
+        st.info("V2.5 checks the exchange universe first and then attempts direct BSE identity resolution. If this still fails, the exchange provider did not return a usable identity for the input.")
         if not matches.empty:
             st.dataframe(matches[["exchange","segment","symbol","company","isin","bse_code","source"]] if "source" in matches.columns else matches[["exchange","segment","symbol","company","isin","bse_code"]], use_container_width=True, hide_index=True)
         st.stop()
@@ -789,7 +854,8 @@ try:
     with st.expander("🔎 Security identity / exchange verification", expanded=True):
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
-        st.caption("Exchange identity is authoritative. V2.4 retrieves OHLCV from NSE/BSE first; yfinance is only a legacy fallback.")
+        if sec.get("segment_note"): st.warning(sec.get("segment_note"))
+        st.caption("Exchange identity is authoritative. V2.5 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -800,7 +866,7 @@ try:
         })
 
     cols=st.columns(6)
-    cols[0].metric("V2.4 Score", f"{overall:.0f}/100")
+    cols[0].metric("V2.5 Score", f"{overall:.0f}/100")
     cols[1].metric("Fundamental", f"{fundamental['score']:.0f}")
     cols[2].metric("Management", "N/A")
     cols[3].metric("Valuation", f"{valuation['score']:.0f}")
@@ -860,7 +926,7 @@ try:
         st.write("FY28 revenue guidance: Not verified")
         st.write("FY28 EBITDA / margin guidance: Not verified")
         st.write("Order book / capex / capacity guidance: Not verified")
-        st.markdown("### What V2.4 should ingest")
+        st.markdown("### What V2.5 should ingest")
         st.write("NSE/BSE announcements, annual reports, investor presentations, earnings-call transcripts and company IR documents, with date/source citations and guidance-vs-actual tracking.")
 
     with tabs[4]:
@@ -907,7 +973,7 @@ try:
         st.markdown("### Quarterly cash flow"); st.dataframe(data["quarterly_cashflow"],use_container_width=True)
 
     st.divider()
-    st.caption("V2.4 is an analytical prototype, not investment advice. Exchange universe discovery uses official NSE/BSE sources; third-party financial data can be delayed, incomplete or unavailable for some SME securities. Verify material decisions against exchange/company filings.")
+    st.caption("V2.5 is an analytical prototype, not investment advice. Exchange identity and security masters are sourced from official exchange endpoints where available; free market-data providers can be incomplete, especially for SME securities. Verify material decisions against exchange/company filings.")
 
 except Exception as exc:
     st.error(f"Could not analyse {stock}. Error: {type(exc).__name__}: {exc}")
