@@ -1,5 +1,6 @@
 import io
 import re
+import json
 import requests
 import streamlit as st
 import pandas as pd
@@ -8,14 +9,14 @@ import yfinance as yf
 from datetime import datetime
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V2.5",
+    page_title="Indian Stock Intelligence V2.6",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ============================================================
-# V2.5: Exchange-first market-data architecture
+# V2.6: Exchange-first market-data architecture
 # NSE + BSE + NSE Emerge + BSE SME security resolver
 # Market-data priority: NSE/BSE exchange data -> optional yfinance fallback.
 # Coverage targets:
@@ -32,6 +33,7 @@ st.set_page_config(
 NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 NSE_SME_URL = "https://nsearchives.nseindia.com/content/equities/SME_EQUITY_L.csv"
 BSE_API = "https://api.bseindia.com/BseIndiaAPI/api"
+BSE_CHART_API = "https://charting.bseindia.com/charting/RestDataProvider.svc/getDat"
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -309,7 +311,7 @@ def resolve_security(query,exchange_choice,universe):
         matches=matches.sort_values("_rank",ascending=False).drop(columns="_rank")
         return matches.iloc[0].to_dict(),matches.head(25)
 
-    # Critical V2.5 change: direct BSE resolution is attempted even when the
+    # Critical V2.6 change: direct BSE resolution is attempted even when the
     # bulk BSE universe is empty. This prevents provider/master failures from
     # being misreported as "unlisted".
     if exchange_choice in ("All Exchanges","BSE","BSE SME"):
@@ -325,7 +327,7 @@ def resolve_security(query,exchange_choice,universe):
 
 
 def yahoo_ticker_for(sec):
-    """Legacy fallback ticker only. Exchange data is preferred in V2.5."""
+    """Legacy fallback ticker only. Exchange data is preferred in V2.6."""
     exchange = str(sec.get("exchange", "NSE")).upper()
     symbol = str(sec.get("symbol", "")).strip().upper()
     code = str(sec.get("bse_code", "")).strip()
@@ -454,8 +456,98 @@ def bse_quote(code):
         return {}
 
 
+def _parse_bse_chart_date(value):
+    """Parse BSE chart date strings used by the public charting service."""
+    if value is None:
+        return pd.NaT
+    text = str(value).strip()
+    for fmt in ["%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M:%S %p", "%m/%d/%Y", "%d/%m/%Y"]:
+        try:
+            return pd.to_datetime(datetime.strptime(text, fmt))
+        except Exception:
+            pass
+    return pd.to_datetime(text, errors="coerce")
+
+
+def _bse_chart_history(code):
+    """Fetch BSE daily OHLCV from BSE's charting service.
+
+    This is intentionally separate from the T12M endpoint. BSE's charting
+    service returns OHLCV arrays and is suitable for technical indicators.
+    """
+    code=str(code or "").strip()
+    if not re.fullmatch(r"\d{5,6}", code):
+        return pd.DataFrame()
+    try:
+        params={
+            "exch":"B",
+            "type":"b",
+            "mode":"bseL",
+            "fromdate":"01-01-1991-01:01:00-AM",
+            "scode":code,
+        }
+        h={**REQUEST_HEADERS,"Origin":"https://www.bseindia.com","Accept":"application/json, text/plain, */*"}
+        r=requests.post(BSE_CHART_API,params=params,headers=h,data="",timeout=30)
+        if not r.ok or not r.text.strip():
+            return pd.DataFrame()
+        outer=r.json()
+        inner=outer.get("getDatResult") if isinstance(outer,dict) else None
+        if isinstance(inner,str):
+            try: inner=json.loads(inner)
+            except Exception: return pd.DataFrame()
+        if not isinstance(inner,dict):
+            inner=outer if isinstance(outer,dict) else {}
+
+        # Some BSE responses expose TradingView-like arrays directly.
+        if all(k in inner for k in ("t","o","h","l","c","v")):
+            out=pd.DataFrame({
+                "Date":pd.to_datetime(inner["t"],unit="s",errors="coerce"),
+                "Open":pd.to_numeric(inner["o"],errors="coerce"),
+                "High":pd.to_numeric(inner["h"],errors="coerce"),
+                "Low":pd.to_numeric(inner["l"],errors="coerce"),
+                "Close":pd.to_numeric(inner["c"],errors="coerce"),
+                "Volume":pd.to_numeric(inner["v"],errors="coerce"),
+            })
+        else:
+            divs=inner.get("DataInputValues",[])
+            if not divs: return pd.DataFrame()
+            d=divs[0] if isinstance(divs,list) else divs
+            def arr(name,key):
+                a=d.get(name,[]) if isinstance(d,dict) else []
+                vals=[]
+                for x in a:
+                    if isinstance(x,dict): vals.append(x.get(key))
+                    else: vals.append(x)
+                return vals
+            dates=arr("DateData","Date")
+            opens=arr("OpenData","Open")
+            highs=arr("HighData","High")
+            lows=arr("LowData","Low")
+            closes=arr("CloseData","Close")
+            vols=arr("VolumeData","Volume")
+            n=min(len(dates),len(opens),len(highs),len(lows),len(closes),len(vols))
+            if n==0: return pd.DataFrame()
+            out=pd.DataFrame({
+                "Date":[_parse_bse_chart_date(x) for x in dates[:n]],
+                "Open":pd.to_numeric(opens[:n],errors="coerce"),
+                "High":pd.to_numeric(highs[:n],errors="coerce"),
+                "Low":pd.to_numeric(lows[:n],errors="coerce"),
+                "Close":pd.to_numeric(closes[:n],errors="coerce"),
+                "Volume":pd.to_numeric(vols[:n],errors="coerce"),
+            })
+        out=out.dropna(subset=["Date","Close"]).set_index("Date").sort_index()
+        if out.empty: return pd.DataFrame()
+        out["Adj Close"]=out["Close"]
+        return out[["Open","High","Low","Close","Adj Close","Volume"]]
+    except Exception:
+        return pd.DataFrame()
+
+
 def bse_history_fallback(code):
-    """Best-effort 12-month BSE price/volume history from BSE public data."""
+    """Best-effort BSE history: charting OHLCV first, T12M second."""
+    chart=_bse_chart_history(code)
+    if not chart.empty:
+        return chart
     try:
         r = requests.get(
             f"{BSE_API}/EquityPriceVolumeT12M/w",
@@ -472,13 +564,10 @@ def bse_history_fallback(code):
             return pd.DataFrame()
         fields = data.get("fields", ["dttm", "vale1", "vole"])
         df = pd.DataFrame(rows, columns=fields[:len(rows[0])])
-        date_col = fields[0]
-        price_col = fields[1]
+        date_col, price_col = fields[0], fields[1]
         vol_col = fields[2] if len(fields) > 2 else None
         out = pd.DataFrame(index=pd.to_datetime(df[date_col], errors="coerce"))
         out["Close"] = pd.to_numeric(df[price_col], errors="coerce")
-        # T12M public endpoint is not a full OHLC feed in all payload versions.
-        # Do not fabricate intraday range: use close as OHLC only when necessary for indicators.
         out["Open"] = out["Close"]
         out["High"] = out["Close"]
         out["Low"] = out["Close"]
@@ -487,7 +576,6 @@ def bse_history_fallback(code):
         return out.dropna(subset=["Close"]).sort_index()
     except Exception:
         return pd.DataFrame()
-
 
 def _clean_yf_history(hist):
     if hist is None or hist.empty:
@@ -507,7 +595,7 @@ def _clean_yf_history(hist):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(sec):
-    """V2.5 exchange-first data layer.
+    """V2.6 exchange-first data layer.
 
     Priority for OHLCV:
       1) NSE public historical API for NSE / NSE Emerge
@@ -533,9 +621,9 @@ def load_stock(sec):
         provider_chain.append("NSE public API")
     elif exchange == "BSE" and code and code.upper() not in {"NAN", "NONE"}:
         hist = bse_history_fallback(code)
-        provider = "BSE public data"
-        history_period = "up to 12 months"
-        provider_chain.append("BSE public data")
+        provider = "BSE public charting API"
+        history_period = "available BSE history"
+        provider_chain.append("BSE charting API → BSE T12M")
 
     # Legacy fallback only after exchange data has failed.
     ticker_symbol = yahoo_ticker_for(sec)
@@ -757,14 +845,14 @@ def management_engine(sec, info):
         "confidence": "LOW — filing-level management evidence not ingested",
         "evidence": evidence,
         "guidance": "Not verified",
-        "note": "V2.5 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
+        "note": "V2.6 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
     }
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V2.5")
+st.title("📊 Indian Stock Intelligence — V2.6")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -776,10 +864,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V2.5 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V2.6 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.5 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.6 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -789,21 +877,21 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V2.5 coverage")
+    st.markdown("### V2.6 coverage")
     st.markdown("- NSE Main Board")
     st.markdown("- NSE Emerge / SME")
     st.markdown("- BSE Main Board — all active equity groups")
     st.markdown("- BSE SME — M / MT / MS / TS groups")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
     st.markdown("- Exchange data first (NSE/BSE); yfinance only as legacy fallback")
-    st.caption("V2.5 separates exchange identity from provider coverage. BSE direct identity resolution is attempted even if the bulk BSE master endpoint is unavailable.")
+    st.caption("V2.6 separates exchange identity from provider coverage. BSE direct identity resolution is attempted even if the bulk BSE master endpoint is unavailable.")
     st.stop()
 
 try:
     sec, matches = resolve_security(stock, exchange_choice, universe)
     if sec is None:
         st.error(f"Could not resolve '{stock}' in the selected exchange/segment universe.")
-        st.info("V2.5 checks the exchange universe first and then attempts direct BSE identity resolution. If this still fails, the exchange provider did not return a usable identity for the input.")
+        st.info("V2.6 checks the exchange universe first and then attempts direct BSE identity resolution. If this still fails, the exchange provider did not return a usable identity for the input.")
         if not matches.empty:
             st.dataframe(matches[["exchange","segment","symbol","company","isin","bse_code","source"]] if "source" in matches.columns else matches[["exchange","segment","symbol","company","isin","bse_code"]], use_container_width=True, hide_index=True)
         st.stop()
@@ -855,7 +943,7 @@ try:
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
         if sec.get("segment_note"): st.warning(sec.get("segment_note"))
-        st.caption("Exchange identity is authoritative. V2.5 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
+        st.caption("Exchange identity is authoritative. V2.6 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -866,7 +954,7 @@ try:
         })
 
     cols=st.columns(6)
-    cols[0].metric("V2.5 Score", f"{overall:.0f}/100")
+    cols[0].metric("V2.6 Score", f"{overall:.0f}/100")
     cols[1].metric("Fundamental", f"{fundamental['score']:.0f}")
     cols[2].metric("Management", "N/A")
     cols[3].metric("Valuation", f"{valuation['score']:.0f}")
@@ -926,7 +1014,7 @@ try:
         st.write("FY28 revenue guidance: Not verified")
         st.write("FY28 EBITDA / margin guidance: Not verified")
         st.write("Order book / capex / capacity guidance: Not verified")
-        st.markdown("### What V2.5 should ingest")
+        st.markdown("### What V2.6 should ingest")
         st.write("NSE/BSE announcements, annual reports, investor presentations, earnings-call transcripts and company IR documents, with date/source citations and guidance-vs-actual tracking.")
 
     with tabs[4]:
@@ -973,7 +1061,7 @@ try:
         st.markdown("### Quarterly cash flow"); st.dataframe(data["quarterly_cashflow"],use_container_width=True)
 
     st.divider()
-    st.caption("V2.5 is an analytical prototype, not investment advice. Exchange identity and security masters are sourced from official exchange endpoints where available; free market-data providers can be incomplete, especially for SME securities. Verify material decisions against exchange/company filings.")
+    st.caption("V2.6 is an analytical prototype, not investment advice. Exchange identity and security masters are sourced from official exchange endpoints where available; free market-data providers can be incomplete, especially for SME securities. Verify material decisions against exchange/company filings.")
 
 except Exception as exc:
     st.error(f"Could not analyse {stock}. Error: {type(exc).__name__}: {exc}")
