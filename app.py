@@ -1,27 +1,47 @@
+import io
+import re
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
-
-# ============================================================
-# Indian Stock Intelligence — V2.1
-# Fundamental + Quarterly + Valuation + Technical + Risk Engine
-# Data source: Yahoo Finance via yfinance
-# ============================================================
+from datetime import datetime
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V2.1",
+    page_title="Indian Stock Intelligence V2.2",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ============================================================
+# V2.2: Multi-exchange universe + Yahoo/BSE fallback data layer
+# Coverage targets:
+#   - NSE Main Board
+#   - NSE Emerge / SME
+#   - BSE Main Board / all active equity groups
+#   - BSE SME (M, MT, MS, TS groups)
+#
+# Important: exchange universe discovery is separated from the
+# market-data provider. A stock can be in the official universe
+# even when Yahoo Finance does not carry a usable history.
+# ============================================================
+
+NSE_EQUITY_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+NSE_SME_URL = "https://nsearchives.nseindia.com/content/equities/SME_EQUITY_L.csv"
+BSE_API = "https://api.bseindia.com/BseIndiaAPI/api"
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.bseindia.com/",
+}
+BSE_SME_GROUPS = {"M", "MT", "MS", "TS"}
+
 # -----------------------------
 # Helpers
 # -----------------------------
-
-def safe_float(x):
+def safe_num(x):
     try:
         if x is None or pd.isna(x):
             return np.nan
@@ -30,936 +50,659 @@ def safe_float(x):
         return np.nan
 
 
-def pct(x):
+def fmt_num(x, decimals=1):
+    x = safe_num(x)
     if pd.isna(x):
         return "N/A"
-    return f"{x * 100:.1f}%"
+    return f"{x:,.{decimals}f}"
 
 
-def money(x):
+def fmt_pct(x, decimals=1):
+    x = safe_num(x)
     if pd.isna(x):
         return "N/A"
-    x = float(x)
-    ax = abs(x)
-    if ax >= 1e12:
-        return f"₹{x/1e12:.2f}T"
-    if ax >= 1e9:
-        return f"₹{x/1e9:.2f}B"
-    if ax >= 1e7:
-        return f"₹{x/1e7:.2f} Cr"
-    if ax >= 1e5:
-        return f"₹{x/1e5:.2f} L"
-    return f"₹{x:,.0f}"
+    return f"{x*100:.{decimals}f}%"
 
 
-def latest_value(df, row_names):
-    if df is None or df.empty:
-        return np.nan
-    for row in row_names:
-        if row in df.index:
-            s = pd.to_numeric(df.loc[row], errors="coerce").dropna()
-            if not s.empty:
-                return float(s.iloc[0])
-    return np.nan
-
-
-def previous_value(df, row_names):
-    if df is None or df.empty:
-        return np.nan
-    for row in row_names:
-        if row in df.index:
-            s = pd.to_numeric(df.loc[row], errors="coerce").dropna()
-            if len(s) >= 2:
-                return float(s.iloc[1])
-    return np.nan
-
-
-def growth(current, previous):
-    if pd.isna(current) or pd.isna(previous) or previous == 0:
-        return np.nan
-    return current / previous - 1
-
-
-def normalize_series(s):
-    s = pd.to_numeric(s, errors="coerce")
-    if s.empty or s.max() == s.min():
-        return pd.Series(50.0, index=s.index)
-    return 100 * (s - s.min()) / (s.max() - s.min())
-
-
-def score_higher_better(value, good, excellent):
-    if pd.isna(value):
+def score_range(x, low, high, inverse=False):
+    x = safe_num(x)
+    if pd.isna(x):
         return 50.0
-    if value >= excellent:
-        return 100.0
-    if value <= 0:
-        return 0.0
-    return max(0.0, min(100.0, 100 * (value / excellent)))
-
-
-def score_lower_better(value, bad, good):
-    if pd.isna(value):
+    if high == low:
         return 50.0
-    if value <= good:
-        return 100.0
-    if value >= bad:
-        return 0.0
-    return max(0.0, min(100.0, 100 * (bad - value) / (bad - good)))
+    s = float(np.clip((x-low)/(high-low)*100, 0, 100))
+    return 100-s if inverse else s
 
 
-def safe_concat_frames(frames):
-    frames = [x for x in frames if x is not None and not x.empty]
-    if not frames:
+def normalize_statement(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
-    return pd.concat(frames, axis=0)
-
-
-# -----------------------------
-# Technical indicators
-# -----------------------------
-
-def add_indicators(df):
-    out = df.copy()
-    close = out["Close"]
-    high = out["High"]
-    low = out["Low"]
-    volume = out["Volume"]
-
-    for n in [20, 50, 100, 200]:
-        out[f"SMA{n}"] = close.rolling(n).mean()
-
-    out["EMA12"] = close.ewm(span=12, adjust=False).mean()
-    out["EMA26"] = close.ewm(span=26, adjust=False).mean()
-    out["MACD"] = out["EMA12"] - out["EMA26"]
-    out["MACD_signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    out["MACD_hist"] = out["MACD"] - out["MACD_signal"]
-
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    out["RSI14"] = 100 - (100 / (1 + rs))
-
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
-    out["ATR14"] = tr.rolling(14).mean()
-    out["ATR_pct"] = out["ATR14"] / close
-
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-    atr14 = tr.rolling(14).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=out.index).rolling(14).sum() / atr14.rolling(14).sum()
-    minus_di = 100 * pd.Series(minus_dm, index=out.index).rolling(14).sum() / atr14.rolling(14).sum()
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    out["ADX14"] = dx.rolling(14).mean()
-
-    out["Vol20"] = volume.rolling(20).mean()
-    out["VolRatio"] = volume / out["Vol20"]
-    out["52W_High"] = close.rolling(252, min_periods=20).max()
-    out["52W_Low"] = close.rolling(252, min_periods=20).min()
-
-    out["Return20"] = close / close.shift(20) - 1
-    out["Return60"] = close / close.shift(60) - 1
-    out["Return120"] = close / close.shift(120) - 1
-
+    out = df.copy().replace([np.inf, -np.inf], np.nan)
+    try:
+        out.columns = [pd.to_datetime(c).strftime("%Y-%m-%d") for c in out.columns]
+    except Exception:
+        out.columns = [str(c) for c in out.columns]
     return out
 
 
-def technical_score(d):
-    if d.empty:
-        return 50.0, []
+def latest_row(df, names):
+    if df is None or df.empty:
+        return np.nan
+    idx = {str(i).lower(): i for i in df.index}
+    for n in names:
+        key = n.lower()
+        if key in idx:
+            row = df.loc[idx[key]]
+            try:
+                return safe_num(row.iloc[0])
+            except Exception:
+                pass
+    return np.nan
 
-    r = d.iloc[-1]
-    score = 50.0
-    positives, negatives = [], []
 
-    close = safe_float(r["Close"])
-    sma20 = safe_float(r["SMA20"])
-    sma50 = safe_float(r["SMA50"])
-    sma200 = safe_float(r["SMA200"])
-    rsi = safe_float(r["RSI14"])
-    macd = safe_float(r["MACD"])
-    signal = safe_float(r["MACD_signal"])
-    adx = safe_float(r["ADX14"])
-    vol_ratio = safe_float(r["VolRatio"])
-
-    if not pd.isna(sma50) and close > sma50:
-        score += 10
-        positives.append("Price is above 50-DMA.")
-    elif not pd.isna(sma50):
-        score -= 10
-        negatives.append("Price is below 50-DMA.")
-
-    if not pd.isna(sma200) and close > sma200:
-        score += 12
-        positives.append("Price is above 200-DMA.")
-    elif not pd.isna(sma200):
-        score -= 12
-        negatives.append("Price is below 200-DMA.")
-
-    if not pd.isna(sma50) and not pd.isna(sma200) and sma50 > sma200:
-        score += 8
-        positives.append("50-DMA is above 200-DMA.")
-    elif not pd.isna(sma50) and not pd.isna(sma200):
-        score -= 8
-        negatives.append("50-DMA is below 200-DMA.")
-
-    if not pd.isna(rsi):
-        if 50 <= rsi <= 68:
-            score += 8
-            positives.append(f"RSI is constructive at {rsi:.1f}.")
-        elif rsi > 75:
-            score -= 5
-            negatives.append(f"RSI is overbought at {rsi:.1f}.")
-        elif rsi < 35:
-            score -= 8
-            negatives.append(f"RSI is weak at {rsi:.1f}.")
-
-    if not pd.isna(macd) and not pd.isna(signal):
-        if macd > signal:
-            score += 7
-            positives.append("MACD is above its signal line.")
-        else:
-            score -= 7
-            negatives.append("MACD is below its signal line.")
-
-    if not pd.isna(adx):
-        if adx >= 25:
-            score += 5
-            positives.append(f"ADX {adx:.1f} indicates a meaningful trend.")
-        elif adx < 15:
-            negatives.append(f"ADX {adx:.1f} indicates a weak trend.")
-
-    if not pd.isna(vol_ratio) and vol_ratio >= 1.5:
-        score += 5
-        positives.append("Volume is elevated versus its 20-day average.")
-
-    return max(0, min(100, score)), positives + negatives
+def find_row(df, candidates):
+    if df is None or df.empty:
+        return None
+    lower = {str(i).lower(): i for i in df.index}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    for i in df.index:
+        s = str(i).lower()
+        for c in candidates:
+            if c.lower() in s:
+                return i
+    return None
 
 
 # -----------------------------
-# Data download
+# Official exchange universes
 # -----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nse_universe():
+    frames = []
+    for url, segment in [(NSE_EQUITY_URL, "NSE Main Board"), (NSE_SME_URL, "NSE Emerge / SME")]:
+        try:
+            r = requests.get(url, headers=REQUEST_HEADERS, timeout=25)
+            r.raise_for_status()
+            df = pd.read_csv(io.BytesIO(r.content))
+            df.columns = [str(c).strip().upper() for c in df.columns]
+            if "SYMBOL" not in df.columns:
+                continue
+            if "SERIES" in df.columns:
+                df = df[df["SERIES"].astype(str).str.upper().isin(["EQ", "BE", "SM"])].copy()
+            out = pd.DataFrame()
+            out["exchange"] = ["NSE"] * len(df)
+            out["segment"] = segment
+            out["symbol"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+            out["company"] = df.get("NAME OF COMPANY", df.get("NAME_OF_COMPANY", out["symbol"])).astype(str).str.strip()
+            out["isin"] = df.get("ISIN NUMBER", df.get("ISIN", "")).astype(str).str.strip()
+            out["series"] = df.get("SERIES", "").astype(str).str.strip()
+            out["bse_code"] = ""
+            frames.append(out)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(columns=["exchange","segment","symbol","company","isin","series","bse_code"])
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(subset=["exchange","symbol","segment"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_bse_universe():
+    try:
+        params = {"scripcode": "", "Group": "", "industry": "", "segment": "Equity", "status": "Active"}
+        r = requests.get(f"{BSE_API}/ListofScripData/w", params=params, headers=REQUEST_HEADERS, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload.get("Table", payload if isinstance(payload, list) else [])
+        if not rows:
+            return pd.DataFrame(columns=["exchange","segment","symbol","company","isin","series","bse_code","group"])
+        df = pd.DataFrame(rows)
+        # BSE has changed field casing/names over time. Resolve common variants.
+        def pick(names, default=""):
+            for n in names:
+                if n in df.columns:
+                    return df[n]
+            return pd.Series([default] * len(df), index=df.index)
+        symbol = pick(["SCRIP_CD", "ScripCode", "scripcode", "Security Code", "scrip_id", "Scrip_ID"])
+        secid = pick(["SecurityId", "SCRIP_ID", "Scrip_Id", "SYMBOL", "Symbol"])
+        name = pick(["Scrip_Name", "Scrip Name", "Security Name", "NAME", "CompanyName"])
+        isin = pick(["ISIN", "ISIN_CODE", "ISIN Code"])
+        group = pick(["GROUP", "Group", "GroupName"])
+        # Some BSE API responses return the numeric code in SCRIP_CD and a symbol in SecurityId.
+        out = pd.DataFrame()
+        out["exchange"] = "BSE"
+        out["group"] = group.astype(str).str.strip().str.upper()
+        out["bse_code"] = symbol.astype(str).str.extract(r"(\d{5,6})", expand=False).fillna("")
+        out["symbol"] = secid.astype(str).str.strip().str.upper()
+        # If symbol is numeric/blank, use code as the searchable identifier.
+        out.loc[out["symbol"].isin(["", "NAN", "NONE"]) | out["symbol"].str.fullmatch(r"\d+", na=False), "symbol"] = out["bse_code"]
+        out["company"] = name.astype(str).str.strip()
+        out["isin"] = isin.astype(str).str.strip()
+        out["series"] = out["group"]
+        out["segment"] = np.where(out["group"].isin(BSE_SME_GROUPS), "BSE SME", "BSE Main Board")
+        out = out[out["bse_code"].str.len() >= 5].copy()
+        return out.drop_duplicates(subset=["bse_code"])
+    except Exception:
+        return pd.DataFrame(columns=["exchange","segment","symbol","company","isin","series","bse_code","group"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_universe():
+    nse = load_nse_universe()
+    bse = load_bse_universe()
+    cols = ["exchange","segment","symbol","company","isin","series","bse_code"]
+    nse = nse.reindex(columns=cols)
+    bse = bse.reindex(columns=cols)
+    universe = pd.concat([nse, bse], ignore_index=True)
+    universe["search_symbol"] = universe["symbol"].fillna("").astype(str).str.upper()
+    universe["search_company"] = universe["company"].fillna("").astype(str).str.upper()
+    universe["search_isin"] = universe["isin"].fillna("").astype(str).str.upper()
+    universe["search_bse"] = universe["bse_code"].fillna("").astype(str).str.upper()
+    return universe.drop_duplicates(subset=["exchange","segment","symbol","bse_code"])
+
+
+def resolve_security(query, exchange_choice, universe):
+    q = str(query).strip().upper()
+    if not q:
+        return None, pd.DataFrame()
+    u = universe.copy()
+    if exchange_choice != "All Exchanges":
+        if exchange_choice == "NSE":
+            u = u[u["exchange"] == "NSE"]
+        elif exchange_choice == "BSE":
+            u = u[u["exchange"] == "BSE"]
+        elif exchange_choice == "NSE Emerge / SME":
+            u = u[u["segment"] == "NSE Emerge / SME"]
+        elif exchange_choice == "BSE SME":
+            u = u[u["segment"] == "BSE SME"]
+    exact = u[(u.search_symbol == q) | (u.search_bse == q) | (u.search_isin == q) | (u.search_company == q)]
+    if not exact.empty:
+        return exact.iloc[0].to_dict(), exact.head(10)
+    mask = (
+        u.search_symbol.str.contains(q, na=False) |
+        u.search_bse.str.contains(q, na=False) |
+        u.search_isin.str.contains(q, na=False) |
+        u.search_company.str.contains(q, na=False)
+    )
+    matches = u[mask].head(25)
+    if not matches.empty:
+        return matches.iloc[0].to_dict(), matches
+    # Last-resort provider resolution for symbols not yet present in a cached universe.
+    if q.isdigit() and len(q) in (5, 6):
+        return {"exchange":"BSE", "segment":"BSE Main Board", "symbol":q, "company":q, "isin":"", "series":"", "bse_code":q}, pd.DataFrame()
+    return None, pd.DataFrame()
+
+
+# -----------------------------
+# Provider helpers
+# -----------------------------
+def yahoo_ticker_for(sec):
+    exchange = sec.get("exchange", "NSE")
+    symbol = str(sec.get("symbol", "")).strip().upper()
+    code = str(sec.get("bse_code", "")).strip()
+    if exchange == "BSE":
+        if code and code != "NAN":
+            return f"{code}.BO"
+        return f"{symbol}.BO"
+    return f"{symbol}.NS"
+
 
 @st.cache_data(ttl=900, show_spinner=False)
-def load_stock(symbol):
-    ticker = yf.Ticker(symbol)
-
-    hist = ticker.history(period="5y", auto_adjust=False)
-    if hist.empty:
-        raise ValueError(f"No price data returned for {symbol}.")
-
-    hist = hist.reset_index()
-    hist.columns = [str(c).replace(" ", "_") for c in hist.columns]
-    if "Datetime" in hist.columns and "Date" not in hist.columns:
-        hist = hist.rename(columns={"Datetime": "Date"})
-
-    hist["Date"] = pd.to_datetime(hist["Date"]).dt.tz_localize(None)
-    hist = hist.set_index("Date")
-    hist = hist[["Open", "High", "Low", "Close", "Adj_Close", "Volume"]] if "Adj_Close" in hist.columns else hist[["Open", "High", "Low", "Close", "Volume"]]
-    hist = hist.dropna(subset=["Close"])
-
-    # yfinance financial statements are DataFrames and are safe to cache.
-    annual_income = ticker.financials
-    annual_balance = ticker.balance_sheet
-    annual_cashflow = ticker.cashflow
-    quarterly_income = ticker.quarterly_financials
-    quarterly_balance = ticker.quarterly_balance_sheet
-    quarterly_cashflow = ticker.quarterly_cashflow
-
+def bse_quote(code):
     try:
-        info = ticker.info
+        r = requests.get(f"{BSE_API}/getScripHeaderData/w", params={"scripcode": code}, headers=REQUEST_HEADERS, timeout=10)
+        r.raise_for_status()
+        h = r.json().get("Header", {})
+        return {k: safe_num(h.get(k)) for k in ["PrevClose","Open","High","Low","LTP"]}
+    except Exception:
+        return {}
+
+
+def bse_history_fallback(code):
+    """Best-effort 12-month BSE price/volume fallback for securities not covered by Yahoo."""
+    try:
+        # Endpoint exposed by the public BSE data service; response is compact fields/data.
+        params = {"scripcode": code}
+        r = requests.get(f"{BSE_API}/EquityPriceVolumeT12M/w", params=params, headers=REQUEST_HEADERS, timeout=20)
+        if not r.ok:
+            return pd.DataFrame()
+        payload = r.json()
+        data = payload.get("Data", {})
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        if not rows:
+            return pd.DataFrame()
+        fields = data.get("fields", ["dttm","vale1","vole"])
+        df = pd.DataFrame(rows, columns=fields[:len(rows[0])])
+        date_col = fields[0]
+        price_col = fields[1]
+        vol_col = fields[2] if len(fields) > 2 else None
+        out = pd.DataFrame(index=pd.to_datetime(df[date_col], errors="coerce"))
+        out["Open"] = pd.to_numeric(df[price_col], errors="coerce")
+        out["High"] = out["Open"]
+        out["Low"] = out["Open"]
+        out["Close"] = out["Open"]
+        out["Adj Close"] = out["Close"]
+        out["Volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else 0
+        return out.dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_stock(sec):
+    ticker_symbol = yahoo_ticker_for(sec)
+    ticker = yf.Ticker(ticker_symbol)
+    hist = pd.DataFrame()
+    provider = "Yahoo Finance"
+    history_period = "5y"
+    try:
+        hist = ticker.history(period="5y", auto_adjust=False)
+    except Exception:
+        hist = pd.DataFrame()
+
+    if hist.empty and sec.get("exchange") == "BSE" and sec.get("bse_code"):
+        hist = bse_history_fallback(str(sec["bse_code"]))
+        provider = "BSE public data fallback"
+        history_period = "up to 12 months"
+
+    info = {}
+    annual_income = quarterly_income = annual_balance = quarterly_balance = annual_cashflow = quarterly_cashflow = pd.DataFrame()
+    news = []
+    try:
+        info = dict(ticker.info or {})
     except Exception:
         info = {}
-
     try:
-        news = ticker.news
+        annual_income = normalize_statement(ticker.get_income_stmt(freq="yearly"))
+        quarterly_income = normalize_statement(ticker.get_income_stmt(freq="quarterly"))
+        annual_balance = normalize_statement(ticker.get_balance_sheet(freq="yearly"))
+        quarterly_balance = normalize_statement(ticker.get_balance_sheet(freq="quarterly"))
+        annual_cashflow = normalize_statement(ticker.get_cash_flow(freq="yearly"))
+        quarterly_cashflow = normalize_statement(ticker.get_cash_flow(freq="quarterly"))
+    except Exception:
+        pass
+    try:
+        raw_news = ticker.news or []
+        for item in raw_news[:20]:
+            content = item.get("content", item)
+            if isinstance(content, dict):
+                title = content.get("title") or item.get("title")
+                publisher = content.get("provider", {}).get("displayName") if isinstance(content.get("provider"), dict) else item.get("publisher")
+                url = content.get("canonicalUrl", {}).get("url") if isinstance(content.get("canonicalUrl"), dict) else item.get("link")
+                pub = content.get("pubDate") or item.get("providerPublishTime")
+            else:
+                title = item.get("title")
+                publisher = item.get("publisher")
+                url = item.get("link")
+                pub = item.get("providerPublishTime")
+            news.append({"title": title, "publisher": publisher, "url": url, "published": pub})
     except Exception:
         news = []
 
+    # BSE current quote can rescue the latest price when Yahoo info is sparse.
+    bse_q = {}
+    if sec.get("exchange") == "BSE" and sec.get("bse_code"):
+        bse_q = bse_quote(str(sec["bse_code"]))
+        if not info.get("currentPrice") and bse_q.get("LTP") is not None:
+            info["currentPrice"] = bse_q.get("LTP")
+        if not info.get("regularMarketPrice") and bse_q.get("LTP") is not None:
+            info["regularMarketPrice"] = bse_q.get("LTP")
+
+    # Fill identity from exchange master when provider metadata is missing.
+    info.setdefault("longName", sec.get("company") or sec.get("symbol"))
+    info.setdefault("sector", None)
+    info.setdefault("industry", None)
+    if sec.get("isin"):
+        info["exchangeISIN"] = sec.get("isin")
+    info["exchange"] = sec.get("exchange")
+    info["listingSegment"] = sec.get("segment")
+    info["providerTicker"] = ticker_symbol
+    info["dataProvider"] = provider
+    info["historyPeriod"] = history_period
     return {
         "hist": hist,
+        "info": info,
         "annual_income": annual_income,
-        "annual_balance": annual_balance,
-        "annual_cashflow": annual_cashflow,
         "quarterly_income": quarterly_income,
+        "annual_balance": annual_balance,
         "quarterly_balance": quarterly_balance,
+        "annual_cashflow": annual_cashflow,
         "quarterly_cashflow": quarterly_cashflow,
-        "info": info if isinstance(info, dict) else {},
-        "news": news if isinstance(news, list) else [],
+        "news": news,
+        "security": sec,
+        "provider": provider,
+        "history_period": history_period,
     }
 
 
 # -----------------------------
-# Fundamental engine
+# Technical engine
 # -----------------------------
-
-def fundamental_engine(data):
-    ai = data["annual_income"]
-    ab = data["annual_balance"]
-    ac = data["annual_cashflow"]
-    qi = data["quarterly_income"]
-    qb = data["quarterly_balance"]
-    qc = data["quarterly_cashflow"]
-
-    revenue = latest_value(ai, ["Total Revenue", "Operating Revenue"])
-    revenue_prev = previous_value(ai, ["Total Revenue", "Operating Revenue"])
-    rev_growth = growth(revenue, revenue_prev)
-
-    ebit = latest_value(ai, ["EBIT", "Operating Income"])
-    ebit_prev = previous_value(ai, ["EBIT", "Operating Income"])
-    ebit_growth = growth(ebit, ebit_prev)
-
-    net_income = latest_value(ai, ["Net Income", "Net Income Common Stockholders"])
-    net_income_prev = previous_value(ai, ["Net Income", "Net Income Common Stockholders"])
-    earnings_growth = growth(net_income, net_income_prev)
-
-    equity = latest_value(ab, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"])
-    debt = latest_value(ab, ["Total Debt", "Total Debt And Capital Lease Obligation"])
-    cash = latest_value(ab, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
-    assets = latest_value(ab, ["Total Assets"])
-
-    roe = net_income / equity if not pd.isna(net_income) and not pd.isna(equity) and equity != 0 else np.nan
-    roa = net_income / assets if not pd.isna(net_income) and not pd.isna(assets) and assets != 0 else np.nan
-    de = debt / equity if not pd.isna(debt) and not pd.isna(equity) and equity != 0 else np.nan
-
-    cfo = latest_value(ac, ["Operating Cash Flow", "Total Cash From Operating Activities"])
-    capex = latest_value(ac, ["Capital Expenditure", "Capital Expenditures"])
-    fcf = latest_value(ac, ["Free Cash Flow"])
-    if pd.isna(fcf) and not pd.isna(cfo) and not pd.isna(capex):
-        fcf = cfo + capex if capex < 0 else cfo - capex
-
-    cfo_to_pat = cfo / net_income if not pd.isna(cfo) and not pd.isna(net_income) and net_income != 0 else np.nan
-
-    # Latest quarter and previous quarter
-    q_revenue = latest_value(qi, ["Total Revenue", "Operating Revenue"])
-    q_revenue_prev = previous_value(qi, ["Total Revenue", "Operating Revenue"])
-    q_earnings = latest_value(qi, ["Net Income", "Net Income Common Stockholders"])
-    q_earnings_prev = previous_value(qi, ["Net Income", "Net Income Common Stockholders"])
-
-    q_revenue_growth_seq = growth(q_revenue, q_revenue_prev)
-    q_earnings_growth_seq = growth(q_earnings, q_earnings_prev)
-
-    score_parts = {
-        "Revenue growth": score_higher_better(rev_growth, 0.10, 0.20),
-        "Earnings growth": score_higher_better(earnings_growth, 0.10, 0.20),
-        "ROE": score_higher_better(roe, 0.10, 0.20),
-        "Debt/equity": score_lower_better(de, 1.5, 0.5),
-        "CFO/PAT": score_higher_better(cfo_to_pat, 0.8, 1.2),
-        "ROA": score_higher_better(roa, 0.03, 0.10),
+def technical_engine(hist):
+    h = hist.copy()
+    close = pd.to_numeric(h["Close"], errors="coerce")
+    high = pd.to_numeric(h["High"], errors="coerce")
+    low = pd.to_numeric(h["Low"], errors="coerce")
+    volume = pd.to_numeric(h["Volume"], errors="coerce")
+    for n in [20, 50, 100, 200]:
+        h[f"SMA{n}"] = close.rolling(n).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    h["MACD"] = ema12 - ema26
+    h["MACDSignal"] = h["MACD"].ewm(span=9, adjust=False).mean()
+    h["MACDHist"] = h["MACD"] - h["MACDSignal"]
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    h["RSI14"] = 100 - 100/(1+rs)
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    h["ATR14"] = tr.rolling(14).mean()
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    h["BBMid"] = mid
+    h["BBUpper"] = mid + 2*std
+    h["BBLower"] = mid - 2*std
+    h["Vol20"] = volume.rolling(20).mean()
+    h["VolumeRatio"] = volume / h["Vol20"].replace(0, np.nan)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    atr = tr.rolling(14).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=h.index).rolling(14).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=h.index).rolling(14).mean() / atr
+    dx = 100 * (plus_di-minus_di).abs() / (plus_di+minus_di).replace(0, np.nan)
+    h["ADX14"] = dx.rolling(14).mean()
+    latest = h.iloc[-1]
+    price = safe_num(latest["Close"])
+    components = {
+        "Price > 20DMA": 15 if price > safe_num(latest["SMA20"]) else 0,
+        "Price > 50DMA": 15 if price > safe_num(latest["SMA50"]) else 0,
+        "Price > 200DMA": 20 if price > safe_num(latest["SMA200"]) else 0,
+        "50DMA > 200DMA": 15 if safe_num(latest["SMA50"]) > safe_num(latest["SMA200"]) else 0,
+        "MACD bullish": 10 if safe_num(latest["MACD"]) > safe_num(latest["MACDSignal"]) else 0,
+        "RSI healthy": 10 if 50 <= safe_num(latest["RSI14"]) <= 70 else (5 if 40 <= safe_num(latest["RSI14"]) < 50 else 0),
+        "ADX > 20": 10 if safe_num(latest["ADX14"]) > 20 else 0,
+        "Volume expansion": 5 if safe_num(latest["VolumeRatio"]) > 1.2 else 0,
     }
+    return h, sum(components.values()), components
 
-    fundamental_score = float(np.mean(list(score_parts.values())))
 
-    positives, concerns = [], []
+# -----------------------------
+# Fundamental / valuation / quality engines
+# -----------------------------
+def fundamental_engine(info, annual_income, annual_balance, annual_cashflow):
+    revenue = latest_row(annual_income, ["Total Revenue", "Operating Revenue", "TotalRevenue"])
+    net_income = latest_row(annual_income, ["Net Income", "Net Income Common Stockholders", "NetIncome"])
+    ebitda = latest_row(annual_income, ["EBITDA", "Normalized EBITDA"])
+    operating_cf = latest_row(annual_cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"])
+    capex = latest_row(annual_cashflow, ["Capital Expenditure", "Capital Expenditures"])
+    debt = latest_row(annual_balance, ["Total Debt", "Total Debt And Capital Lease Obligation"])
+    equity = latest_row(annual_balance, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"])
+    cash = latest_row(annual_balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
+    roe = safe_num(info.get("returnOnEquity")); roa = safe_num(info.get("returnOnAssets")); margin = safe_num(info.get("profitMargins"))
+    rev_growth = safe_num(info.get("revenueGrowth")); earnings_growth = safe_num(info.get("earningsGrowth")); de = safe_num(info.get("debtToEquity"))
+    fcf = np.nan
+    if not pd.isna(operating_cf) and not pd.isna(capex):
+        fcf = operating_cf + capex if capex < 0 else operating_cf - capex
+    components = {
+        "ROE": score_range(roe, 0.08, 0.25), "ROA": score_range(roa, 0.03, 0.15),
+        "Revenue growth": score_range(rev_growth, 0.00, 0.25), "Earnings growth": score_range(earnings_growth, 0.00, 0.30),
+        "Profit margin": score_range(margin, 0.05, 0.25), "Debt discipline": score_range(de, 20, 150, inverse=True),
+    }
+    return {"score": float(np.mean(list(components.values()))), "components": components, "revenue": revenue, "net_income": net_income,
+            "ebitda": ebitda, "operating_cf": operating_cf, "capex": capex, "fcf": fcf, "debt": debt, "equity": equity, "cash": cash,
+            "roe": roe, "roa": roa, "margin": margin, "rev_growth": rev_growth, "earnings_growth": earnings_growth, "de": de}
 
-    if not pd.isna(rev_growth) and rev_growth > 0.10:
-        positives.append(f"Annual revenue growth is {pct(rev_growth)}.")
-    elif not pd.isna(rev_growth) and rev_growth < 0:
-        concerns.append(f"Annual revenue declined {pct(abs(rev_growth))}.")
 
-    if not pd.isna(roe):
-        (positives if roe >= 0.15 else concerns).append(f"ROE is {pct(roe)}.")
+def valuation_engine(info, fundamental):
+    pe = safe_num(info.get("trailingPE")); fpe = safe_num(info.get("forwardPE")); peg = safe_num(info.get("pegRatio")); pb = safe_num(info.get("priceToBook")); ev_ebitda = safe_num(info.get("enterpriseToEbitda")); ps = safe_num(info.get("priceToSalesTrailing12Months"))
+    parts = {"P/E": 50 if pd.isna(pe) else score_range(pe,10,60,True), "Forward P/E": 50 if pd.isna(fpe) else score_range(fpe,8,50,True),
+             "PEG": 50 if pd.isna(peg) else score_range(peg,.5,3,True), "P/B": 50 if pd.isna(pb) else score_range(pb,1,10,True),
+             "EV/EBITDA": 50 if pd.isna(ev_ebitda) else score_range(ev_ebitda,5,35,True)}
+    return {"score": float(np.mean(list(parts.values()))), "parts": parts, "pe": pe, "forward_pe": fpe, "peg": peg, "pb": pb, "ev_ebitda": ev_ebitda, "ps": ps}
 
-    if not pd.isna(de):
-        (positives if de <= 0.5 else concerns).append(f"Debt/equity is {de:.2f}.")
 
-    if not pd.isna(cfo_to_pat):
-        if cfo_to_pat >= 1:
-            positives.append(f"Operating cash flow is {cfo_to_pat:.2f}x reported PAT.")
-        elif cfo_to_pat < 0.7:
-            concerns.append(f"Cash conversion is weak at {cfo_to_pat:.2f}x PAT.")
+def quality_engine(info, fundamental):
+    flags=[]; positives=[]
+    if not pd.isna(fundamental["roe"]) and fundamental["roe"] >= .15: positives.append(f"ROE is {fundamental['roe']*100:.1f}%, above 15%.")
+    if not pd.isna(fundamental["rev_growth"]):
+        g=fundamental["rev_growth"]
+        if g >= .15: positives.append(f"Revenue grew {g*100:.1f}% YoY — strong growth.")
+        elif g >= .05: positives.append(f"Revenue grew {g*100:.1f}% YoY — moderate growth.")
+        elif g >= 0: flags.append(f"Revenue growth is only {g*100:.1f}% YoY — weak growth.")
+        else: flags.append(f"Revenue declined {abs(g)*100:.1f}% YoY.")
+    if not pd.isna(fundamental["fcf"]) and fundamental["fcf"] > 0: positives.append("Latest annual cash flow indicates positive free cash flow.")
+    if not pd.isna(fundamental["de"]) and fundamental["de"] > 150: flags.append("Debt/equity is elevated.")
+    if not pd.isna(fundamental["earnings_growth"]) and fundamental["earnings_growth"] < 0: flags.append(f"Earnings growth is negative ({fundamental['earnings_growth']*100:.1f}%).")
+    if not pd.isna(fundamental["fcf"]) and not pd.isna(fundamental["net_income"]) and fundamental["fcf"] < 0 and fundamental["net_income"] > 0:
+        flags.append("Positive accounting profit with negative latest annual free cash flow; investigate earnings quality/capex.")
+    promoter=safe_num(info.get("heldPercentInsiders"))
+    if not pd.isna(promoter) and promoter < .20: flags.append("Insider/promoter ownership is below 20% in the available snapshot.")
+    return max(0, min(100, 100-12*len(flags)+6*len(positives))), positives, flags
 
-    if not pd.isna(fcf):
-        (positives if fcf > 0 else concerns).append(
-            f"Latest annual free cash flow is {money(fcf)}."
-        )
 
+# -----------------------------
+# Management/evidence placeholder — explicit, never fabricated
+# -----------------------------
+def management_engine(sec, info):
+    # V2.2 separates evidence availability from management quality.
+    # Company-specific guidance still requires filings/IR documents.
+    evidence=[]
+    if sec.get("exchange"): evidence.append(f"Exchange universe verified: {sec.get('exchange')} / {sec.get('segment')}.")
+    if info.get("exchangeISIN"): evidence.append("ISIN verified from exchange universe.")
+    provider=info.get("dataProvider")
+    evidence.append(f"Market-data provider: {provider}.")
     return {
-        "score": fundamental_score,
-        "score_parts": score_parts,
-        "revenue": revenue,
-        "rev_growth": rev_growth,
-        "ebit": ebit,
-        "ebit_growth": ebit_growth,
-        "net_income": net_income,
-        "earnings_growth": earnings_growth,
-        "equity": equity,
-        "debt": debt,
-        "cash": cash,
-        "roe": roe,
-        "roa": roa,
-        "de": de,
-        "cfo": cfo,
-        "fcf": fcf,
-        "cfo_to_pat": cfo_to_pat,
-        "q_revenue": q_revenue,
-        "q_revenue_growth_seq": q_revenue_growth_seq,
-        "q_earnings": q_earnings,
-        "q_earnings_growth_seq": q_earnings_growth_seq,
-        "positives": positives,
-        "concerns": concerns,
-        "quarterly_income": qi,
-        "quarterly_balance": qb,
-        "quarterly_cashflow": qc,
+        "score": np.nan,
+        "confidence": "LOW — filing-level management evidence not ingested",
+        "evidence": evidence,
+        "guidance": "Not verified",
+        "note": "V2.2 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
     }
-
-
-# -----------------------------
-# Valuation engine
-# -----------------------------
-
-def valuation_engine(info, price, fundamental):
-    pe = safe_float(info.get("trailingPE"))
-    forward_pe = safe_float(info.get("forwardPE"))
-    pb = safe_float(info.get("priceToBook"))
-    ps = safe_float(info.get("priceToSalesTrailing12Months"))
-    ev_ebitda = safe_float(info.get("enterpriseToEbitda"))
-    dividend_yield = safe_float(info.get("dividendYield"))
-
-    scores = []
-
-    # These are deliberately conservative because sector multiples differ.
-    if not pd.isna(pe):
-        scores.append(80 if pe < 15 else 65 if pe < 22 else 50 if pe < 30 else 30)
-    if not pd.isna(forward_pe):
-        scores.append(80 if forward_pe < 15 else 65 if forward_pe < 22 else 50 if forward_pe < 30 else 30)
-    if not pd.isna(pb):
-        scores.append(80 if pb < 3 else 60 if pb < 5 else 40 if pb < 8 else 25)
-    if not pd.isna(ev_ebitda):
-        scores.append(80 if ev_ebitda < 12 else 65 if ev_ebitda < 18 else 50 if ev_ebitda < 25 else 30)
-
-    score = float(np.mean(scores)) if scores else 50.0
-
-    positives, concerns = [], []
-    if not pd.isna(forward_pe) and not pd.isna(pe) and forward_pe < pe:
-        positives.append("Forward P/E is below trailing P/E, implying expected earnings improvement.")
-    if not pd.isna(pe) and pe > 30:
-        concerns.append(f"Trailing P/E is elevated at {pe:.1f}x.")
-    if not pd.isna(ev_ebitda) and ev_ebitda > 25:
-        concerns.append(f"EV/EBITDA is elevated at {ev_ebitda:.1f}x.")
-
-    return {
-        "score": score,
-        "pe": pe,
-        "forward_pe": forward_pe,
-        "pb": pb,
-        "ps": ps,
-        "ev_ebitda": ev_ebitda,
-        "dividend_yield": dividend_yield,
-        "positives": positives,
-        "concerns": concerns,
-    }
-
-
-# -----------------------------
-# Quarterly engine
-# -----------------------------
-
-def quarterly_engine(fundamental):
-    qi = fundamental["quarterly_income"]
-    if qi is None or qi.empty:
-        return {"score": 50, "table": pd.DataFrame(), "commentary": ["Quarterly data unavailable."]}
-
-    rows = {}
-    for label, names in {
-        "Revenue": ["Total Revenue", "Operating Revenue"],
-        "EBIT": ["EBIT", "Operating Income"],
-        "PAT": ["Net Income", "Net Income Common Stockholders"],
-        "EBITDA": ["EBITDA"],
-    }.items():
-        if any(n in qi.index for n in names):
-            for n in names:
-                if n in qi.index:
-                    rows[label] = pd.to_numeric(qi.loc[n], errors="coerce")
-                    break
-
-    if not rows:
-        return {"score": 50, "table": pd.DataFrame(), "commentary": ["Quarterly income statement unavailable."]}
-
-    qtable = pd.DataFrame(rows)
-    qtable.index = pd.to_datetime(qtable.index).strftime("%Y-%m-%d")
-    qtable = qtable.sort_index(ascending=False)
-
-    comments = []
-    score = 50.0
-
-    if "Revenue" in qtable:
-        vals = qtable["Revenue"].dropna()
-        if len(vals) >= 2:
-            g = growth(vals.iloc[0], vals.iloc[1])
-            if not pd.isna(g):
-                if g > 0.05:
-                    score += 12
-                    comments.append(f"Latest quarter revenue grew {pct(g)} sequentially.")
-                elif g < -0.05:
-                    score -= 12
-                    comments.append(f"Latest quarter revenue declined {pct(abs(g))} sequentially.")
-
-    if "PAT" in qtable:
-        vals = qtable["PAT"].dropna()
-        if len(vals) >= 2:
-            g = growth(vals.iloc[0], vals.iloc[1])
-            if not pd.isna(g):
-                if g > 0.05:
-                    score += 12
-                    comments.append(f"Latest quarter PAT grew {pct(g)} sequentially.")
-                elif g < -0.05:
-                    score -= 12
-                    comments.append(f"Latest quarter PAT declined {pct(abs(g))} sequentially.")
-
-    return {
-        "score": max(0, min(100, score)),
-        "table": qtable,
-        "commentary": comments,
-    }
-
-
-# -----------------------------
-# Risk + position sizing
-# -----------------------------
-
-def risk_engine(hist, capital, risk_pct, objective):
-    d = add_indicators(hist)
-    r = d.iloc[-1]
-
-    price = safe_float(r["Close"])
-    atr = safe_float(r["ATR14"])
-    sma20 = safe_float(r["SMA20"])
-    sma50 = safe_float(r["SMA50"])
-
-    if pd.isna(atr) or atr <= 0:
-        atr = price * 0.03
-
-    if objective == "Long Term":
-        stop = min(
-            price - 2.5 * atr,
-            sma50 * 0.93 if not pd.isna(sma50) else price - 2.5 * atr,
-        )
-        risk_multiple = 3.0
-    elif objective == "Swing":
-        stop = min(
-            price - 1.8 * atr,
-            sma20 * 0.96 if not pd.isna(sma20) else price - 1.8 * atr,
-        )
-        risk_multiple = 2.5
-    else:
-        stop = price - 1.2 * atr
-        risk_multiple = 1.5
-
-    if stop <= 0 or stop >= price:
-        stop = price * 0.95
-
-    risk_per_share = price - stop
-    max_loss = capital * risk_pct / 100
-    qty = int(max_loss / risk_per_share) if risk_per_share > 0 else 0
-    deployed = qty * price
-    target = price + risk_multiple * risk_per_share
-
-    return {
-        "price": price,
-        "atr": atr,
-        "stop": stop,
-        "risk_per_share": risk_per_share,
-        "max_loss": max_loss,
-        "qty": qty,
-        "deployed": deployed,
-        "target": target,
-        "rr": risk_multiple,
-    }
-
-
-# -----------------------------
-# Decision engine
-# -----------------------------
-
-def decision_engine(fundamental, quarterly, valuation, technical, objective):
-    weights = {
-        "Long Term": {"fundamental": 0.35, "quarterly": 0.20, "valuation": 0.20, "technical": 0.15, "quality": 0.10},
-        "Swing": {"fundamental": 0.15, "quarterly": 0.15, "valuation": 0.10, "technical": 0.50, "quality": 0.10},
-        "Intraday": {"fundamental": 0.05, "quarterly": 0.05, "valuation": 0.05, "technical": 0.75, "quality": 0.10},
-    }[objective]
-
-    quality = np.mean([
-        fundamental["score_parts"].get("ROE", 50),
-        fundamental["score_parts"].get("Debt/equity", 50),
-        fundamental["score_parts"].get("CFO/PAT", 50),
-    ])
-
-    score = (
-        fundamental["score"] * weights["fundamental"]
-        + quarterly["score"] * weights["quarterly"]
-        + valuation["score"] * weights["valuation"]
-        + technical * weights["technical"]
-        + quality * weights["quality"]
-    )
-
-    if score >= 75:
-        action = "ACCUMULATE / BUY ON CONFIRMATION"
-    elif score >= 62:
-        action = "SELECTIVE ENTRY / WATCH"
-    elif score >= 48:
-        action = "HOLD / WAIT FOR BETTER SETUP"
-    else:
-        action = "AVOID / WAIT"
-
-    return float(score), action
 
 
 # -----------------------------
 # UI
 # -----------------------------
+st.title("📊 Indian Stock Intelligence — V2.2")
+st.caption("Multi-exchange Fundamental + Evidence + Valuation + Technical + Risk decision-support engine")
 
-st.title("📊 Indian Stock Intelligence — V2.1")
-st.caption("Fundamental + Quarterly + Valuation + Technical + Risk decision-support engine")
-
-st.info(
-    "V2.1 uses publicly available Yahoo Finance data through yfinance. "
-    "Data can be delayed, incomplete or differently mapped from company filings. "
-    "Management guidance and earnings-call commentary are NOT invented when unavailable. "
-    "Verify material decisions against NSE/BSE/company filings."
-)
+universe = load_universe()
 
 with st.sidebar:
     st.header("Analysis Inputs")
-
-    symbol = st.text_input("NSE stock symbol", value="RELIANCE").strip().upper()
-    symbol = symbol.replace(".NS", "") + ".NS"
-
-    capital = st.number_input(
-        "Portfolio capital (₹)",
-        min_value=10000,
-        value=500000,
-        step=10000,
-    )
-
-    risk_pct = st.number_input(
-        "Risk per trade (%)",
-        min_value=0.1,
-        max_value=5.0,
-        value=1.0,
-        step=0.1,
-    )
-
-    objective = st.selectbox(
-        "Primary objective",
-        ["Long Term", "Swing", "Intraday"],
-        index=0,
-    )
-
-    run = st.button("🚀 RUN V2.1 ANALYSIS", use_container_width=True, type="primary")
+    exchange_choice = st.selectbox("Exchange / segment", ["All Exchanges", "NSE", "BSE", "NSE Emerge / SME", "BSE SME"])
+    stock = st.text_input("Symbol / BSE code / ISIN / company", "RELIANCE").strip().upper()
+    capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
+    risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+    objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
+    run = st.button("🚀 RUN V2.2 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.markdown("## What V2.1 adds")
-    st.markdown(
-        """
-        - **Fundamental quality score:** growth, ROE, ROA, leverage and cash conversion
-        - **Quarterly trend engine:** sequential revenue/PAT direction
-        - **Valuation engine:** P/E, forward P/E, P/B, P/S and EV/EBITDA where available
-        - **Technical engine:** 20/50/100/200 DMA, RSI, MACD, ADX, ATR and volume
-        - **Entry framework:** support/stop/target context
-        - **Risk-based position sizing:** capital × risk % ÷ stop-loss distance
-        - **Separate Long Term / Swing / Intraday weighting**
-        - **Management evidence discipline:** unavailable guidance is explicitly marked rather than invented
-        """
-    )
-    st.warning("Enter an NSE symbol and click RUN V2.1 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.2 ANALYSIS.")
+    a,b,c,d = st.columns(4)
+    nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
+    bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
+    nse_sme = len(universe[universe.segment == "NSE Emerge / SME"]) if not universe.empty else 0
+    bse_sme = len(universe[universe.segment == "BSE SME"]) if not universe.empty else 0
+    a.metric("NSE universe", f"{nse_count:,}")
+    b.metric("BSE universe", f"{bse_count:,}")
+    c.metric("NSE Emerge / SME", f"{nse_sme:,}")
+    d.metric("BSE SME", f"{bse_sme:,}")
+    st.markdown("### V2.2 coverage")
+    st.markdown("- NSE Main Board")
+    st.markdown("- NSE Emerge / SME")
+    st.markdown("- BSE Main Board — all active equity groups")
+    st.markdown("- BSE SME — M / MT / MS / TS groups")
+    st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
+    st.markdown("- Yahoo Finance first; BSE public-data fallback where available")
+    st.caption("Exchange-universe discovery is separate from market-data availability. A listed stock can exist in the universe even when a free third-party provider has incomplete history.")
     st.stop()
 
 try:
-    data = load_stock(symbol)
-except Exception as e:
-    st.error(f"Could not analyse {symbol.replace('.NS','')}: {e}")
-    st.stop()
+    sec, matches = resolve_security(stock, exchange_choice, universe)
+    if sec is None:
+        st.error(f"Could not find '{stock}' in the selected exchange/segment universe.")
+        if not matches.empty:
+            st.dataframe(matches[["exchange","segment","symbol","company","isin","bse_code"]], use_container_width=True, hide_index=True)
+        st.stop()
 
-hist = data["hist"]
-hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
-d = add_indicators(hist)
+    if len(matches) > 1 and stock not in [str(sec.get("symbol","")), str(sec.get("bse_code",""))]:
+        st.info("Multiple matches found. The first exact/best match is being analysed.")
+        st.dataframe(matches[["exchange","segment","symbol","company","isin","bse_code"]], use_container_width=True, hide_index=True)
 
-fundamental = fundamental_engine(data)
-quarterly = quarterly_engine(fundamental)
-valuation = valuation_engine(data["info"], safe_float(d["Close"].iloc[-1]), fundamental)
-technical_score_value, technical_notes = technical_score(d)
-risk = risk_engine(hist, capital, risk_pct, objective)
-overall, action = decision_engine(
-    fundamental,
-    quarterly,
-    valuation,
-    technical_score_value,
-    objective,
-)
+    with st.spinner(f"Loading {sec.get('company') or stock} data..."):
+        data = load_stock(sec)
 
-# -----------------------------
-# Header metrics
-# -----------------------------
+    hist = data["hist"]; info = data["info"]
+    if hist.empty:
+        st.error("The stock is present in the official exchange universe, but no usable historical market-data series was returned by the available providers.")
+        st.warning("This is a data-coverage limitation, not a statement that the security is unlisted.")
+        st.write({"Exchange":sec.get("exchange"),"Segment":sec.get("segment"),"BSE code":sec.get("bse_code"),"ISIN":sec.get("isin"),"Yahoo ticker":info.get("providerTicker")})
+        st.stop()
 
-st.subheader(f"{data['info'].get('longName', symbol.replace('.NS',''))} ({symbol.replace('.NS','')})")
+    tech, technical_score, technical_components = technical_engine(hist)
+    fundamental = fundamental_engine(info, data["annual_income"], data["annual_balance"], data["annual_cashflow"])
+    valuation = valuation_engine(info, fundamental)
+    quality_score, positives, flags = quality_engine(info, fundamental)
+    management = management_engine(sec, info)
+    management_display = 50.0 if pd.isna(management["score"]) else management["score"]
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("V2.1 Score", f"{overall:.0f}/100")
-m2.metric("Fundamental", f"{fundamental['score']:.0f}")
-m3.metric("Quarterly", f"{quarterly['score']:.0f}")
-m4.metric("Valuation", f"{valuation['score']:.0f}")
-m5.metric("Technical", f"{technical_score_value:.0f}")
-
-if overall >= 75:
-    st.success(f"🟢 {action}")
-elif overall >= 62:
-    st.warning(f"🟡 {action}")
-else:
-    st.error(f"🔴 {action}")
-
-st.caption(f"Primary objective: {objective}")
-
-# -----------------------------
-# Price / market snapshot
-# -----------------------------
-
-st.markdown("## Market snapshot")
-s1, s2, s3, s4, s5 = st.columns(5)
-
-price = safe_float(d["Close"].iloc[-1])
-high52 = safe_float(d["52W_High"].iloc[-1])
-low52 = safe_float(d["52W_Low"].iloc[-1])
-market_cap = safe_float(data["info"].get("marketCap"))
-beta = safe_float(data["info"].get("beta"))
-
-s1.metric("Price", money(price))
-s2.metric("52W High", money(high52))
-s3.metric("52W Low", money(low52))
-s4.metric("Market Cap", money(market_cap))
-s5.metric("Beta", "N/A" if pd.isna(beta) else f"{beta:.2f}")
-
-# -----------------------------
-# Tabs
-# -----------------------------
-
-tabs = st.tabs([
-    "🎯 Executive Decision",
-    "🏢 Fundamentals",
-    "📅 Quarterly",
-    "💰 Valuation",
-    "📈 Technicals",
-    "🛡️ Risk & Position",
-    "🧠 Management / Evidence",
-    "📰 Recent News",
-])
-
-with tabs[0]:
-    st.markdown("### Decision framework")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown("#### Key positives")
-        positives = fundamental["positives"] + valuation["positives"]
-        positives += [x for x in technical_notes if not any(k in x.lower() for k in ["below", "weak", "overbought"])]
-        if positives:
-            for x in positives[:8]:
-                st.success("✓ " + x)
-        else:
-            st.info("No strong positive signal identified from available data.")
-
-    with c2:
-        st.markdown("#### Key concerns")
-        concerns = fundamental["concerns"] + valuation["concerns"]
-        concerns += [x for x in technical_notes if any(k in x.lower() for k in ["below", "weak", "overbought"])]
-        if concerns:
-            for x in concerns[:8]:
-                st.error("⚠ " + x)
-        else:
-            st.success("No major automated red flag identified.")
-
-    st.markdown("### What would improve the setup?")
-    if technical_score_value < 60:
-        st.write("• Wait for technical trend confirmation: price above key moving averages and improving momentum.")
-    if fundamental["score"] < 60:
-        st.write("• Wait for improvement in earnings quality, cash conversion, leverage or growth.")
-    if valuation["score"] < 60:
-        st.write("• Prefer an improved valuation/price entry rather than chasing the stock.")
-    if technical_score_value >= 60 and fundamental["score"] >= 60 and valuation["score"] >= 60:
-        st.write("• The setup is reasonably aligned; use the risk framework rather than deploying the full portfolio at once.")
-
-with tabs[1]:
-    st.markdown("### Fundamental quality")
-
-    f1, f2, f3, f4 = st.columns(4)
-    f1.metric("Revenue growth", pct(fundamental["rev_growth"]))
-    f2.metric("EBIT growth", pct(fundamental["ebit_growth"]))
-    f3.metric("PAT growth", pct(fundamental["earnings_growth"]))
-    f4.metric("ROE", pct(fundamental["roe"]))
-
-    f5, f6, f7, f8 = st.columns(4)
-    f5.metric("ROA", pct(fundamental["roa"]))
-    f6.metric("Debt / Equity", "N/A" if pd.isna(fundamental["de"]) else f"{fundamental['de']:.2f}x")
-    f7.metric("CFO / PAT", "N/A" if pd.isna(fundamental["cfo_to_pat"]) else f"{fundamental['cfo_to_pat']:.2f}x")
-    f8.metric("Free cash flow", money(fundamental["fcf"]))
-
-    st.markdown("### Fundamental score components")
-    score_df = pd.DataFrame(
-        {"Score": fundamental["score_parts"]}
-    )
-    st.bar_chart(score_df)
-
-    st.markdown("### Annual income statement")
-    ai = data["annual_income"]
-    if ai is not None and not ai.empty:
-        display_rows = [r for r in ["Total Revenue", "EBIT", "EBITDA", "Net Income", "Diluted EPS"] if r in ai.index]
-        if display_rows:
-            st.dataframe(ai.loc[display_rows], use_container_width=True)
+    overall = 0.35*fundamental["score"] + 0.20*management_display + 0.15*valuation["score"] + 0.20*technical_score + 0.10*quality_score
+    if objective == "Long Term":
+        objective_score = 0.45*fundamental["score"] + 0.25*management_display + 0.20*valuation["score"] + 0.10*quality_score
+    elif objective == "Swing Trading":
+        objective_score = 0.55*technical_score + 0.20*valuation["score"] + 0.15*quality_score + 0.10*fundamental["score"]
     else:
-        st.info("Annual income statement unavailable.")
+        objective_score = 0.70*technical_score + 0.20*quality_score + 0.10*valuation["score"]
 
-with tabs[2]:
-    st.markdown("### Quarterly trend")
-    if not quarterly["table"].empty:
-        st.dataframe(quarterly["table"].head(8), use_container_width=True)
-        for c in quarterly["commentary"]:
-            st.info("• " + c)
-    else:
-        st.warning("Quarterly data is unavailable from the current data source.")
+    if objective_score >= 75: verdict="🟢 STRONG SETUP"
+    elif objective_score >= 60: verdict="🟡 SELECTIVE / WATCH"
+    elif objective_score >= 45: verdict="🟠 WAIT / NEUTRAL"
+    else: verdict="🔴 AVOID / HIGH RISK"
 
-with tabs[3]:
-    st.markdown("### Valuation")
-    v1, v2, v3, v4, v5 = st.columns(5)
-    v1.metric("P/E", "N/A" if pd.isna(valuation["pe"]) else f"{valuation['pe']:.1f}x")
-    v2.metric("Forward P/E", "N/A" if pd.isna(valuation["forward_pe"]) else f"{valuation['forward_pe']:.1f}x")
-    v3.metric("P/B", "N/A" if pd.isna(valuation["pb"]) else f"{valuation['pb']:.1f}x")
-    v4.metric("P/S", "N/A" if pd.isna(valuation["ps"]) else f"{valuation['ps']:.1f}x")
-    v5.metric("EV/EBITDA", "N/A" if pd.isna(valuation["ev_ebitda"]) else f"{valuation['ev_ebitda']:.1f}x")
+    company = info.get("longName") or sec.get("company") or stock
+    price = safe_num(tech.iloc[-1]["Close"])
+    high52 = safe_num(info.get("fiftyTwoWeekHigh")); low52 = safe_num(info.get("fiftyTwoWeekLow"))
+    if pd.isna(high52) and not pd.isna(price): high52 = safe_num(tech["High"].tail(252).max())
+    if pd.isna(low52) and not pd.isna(price): low52 = safe_num(tech["Low"].tail(252).min())
 
-    if valuation["dividend_yield"] and not pd.isna(valuation["dividend_yield"]):
-        st.write(f"Dividend yield: **{pct(valuation['dividend_yield'])}**")
+    st.subheader(f"{company} ({sec.get('symbol') or stock})")
+    st.caption(f"{sec.get('exchange')} • {sec.get('segment')} • BSE code: {sec.get('bse_code') or '—'} • ISIN: {sec.get('isin') or '—'} • Data: {data['provider']} ({data['history_period']})")
 
-    st.warning(
-        "Valuation is deliberately not sector-normalized in V2.1. "
-        "Use peer multiples before treating this score as a buy/sell signal."
-    )
+    cols=st.columns(6)
+    cols[0].metric("V2.2 Score", f"{overall:.0f}/100")
+    cols[1].metric("Fundamental", f"{fundamental['score']:.0f}")
+    cols[2].metric("Management", "N/A")
+    cols[3].metric("Valuation", f"{valuation['score']:.0f}")
+    cols[4].metric("Technical", f"{technical_score:.0f}")
+    cols[5].metric("Quality/Risk", f"{quality_score:.0f}")
 
-with tabs[4]:
-    st.markdown("### Technical dashboard")
+    if "STRONG" in verdict: st.success(verdict)
+    elif "WATCH" in verdict: st.warning(verdict)
+    elif "WAIT" in verdict: st.info(verdict)
+    else: st.error(verdict)
+    st.caption(f"Primary objective: {objective} | Objective-specific score: {objective_score:.0f}/100")
 
-    r = d.iloc[-1]
+    tabs=st.tabs(["🎯 Executive Decision","🏢 Fundamentals","📊 Quarterly","🧠 Management / Evidence","💰 Valuation","📈 Technicals","🚨 Risks & Catalysts","📰 Recent News","📋 Raw Financials"])
 
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("RSI(14)", "N/A" if pd.isna(r["RSI14"]) else f"{r['RSI14']:.1f}")
-    t2.metric("ADX(14)", "N/A" if pd.isna(r["ADX14"]) else f"{r['ADX14']:.1f}")
-    t3.metric("ATR", money(r["ATR14"]))
-    t4.metric("Volume / 20D avg", "N/A" if pd.isna(r["VolRatio"]) else f"{r['VolRatio']:.2f}x")
+    with tabs[0]:
+        a,b,c,d=st.columns(4)
+        a.metric("Price", f"₹{price:,.2f}")
+        b.metric("52W High", f"₹{high52:,.2f}" if not pd.isna(high52) else "N/A")
+        c.metric("52W Low", f"₹{low52:,.2f}" if not pd.isna(low52) else "N/A")
+        mcap=info.get("marketCap")
+        d.metric("Market Cap", f"₹{mcap/1e7:,.0f} Cr" if mcap else "N/A")
+        st.markdown("### Coverage & decision framework")
+        st.write("The security was resolved from an exchange-aware universe. Market-data provider coverage is shown separately so missing third-party data is not mistaken for a missing listing.")
+        st.markdown("### Key positives")
+        for p in positives: st.success("✓ "+p)
+        if not positives: st.write("No strong positive flags identified by the current structured-data rules.")
+        st.markdown("### Key concerns")
+        for f in flags: st.error("⚠ "+f)
+        if not flags: st.success("No major automated red flags triggered.")
 
-    chart_cols = ["Close", "SMA20", "SMA50", "SMA200"]
-    chart_df = d[chart_cols].tail(300).copy()
-    st.line_chart(chart_df)
+    with tabs[1]:
+        st.markdown("### Fundamental scorecard")
+        st.dataframe(pd.DataFrame({"Metric":["ROE","ROA","Revenue growth","Earnings growth","Profit margin","Debt/Equity","Latest annual FCF"],"Value":[fmt_pct(fundamental['roe']),fmt_pct(fundamental['roa']),fmt_pct(fundamental['rev_growth']),fmt_pct(fundamental['earnings_growth']),fmt_pct(fundamental['margin']),fmt_num(fundamental['de']),f"₹{fundamental['fcf']/1e7:,.1f} Cr" if not pd.isna(fundamental['fcf']) else "N/A"]}),use_container_width=True,hide_index=True)
+        st.bar_chart(pd.Series(fundamental["components"]))
+        st.markdown("### Annual income statement")
+        st.dataframe(data["annual_income"],use_container_width=True)
 
-    tech_table = pd.DataFrame({
-        "Indicator": [
-            "Close", "20 DMA", "50 DMA", "100 DMA", "200 DMA",
-            "RSI14", "MACD", "MACD Signal", "ADX14", "ATR14",
-            "52W High", "52W Low", "20D Return", "60D Return"
-        ],
-        "Value": [
-            r["Close"], r["SMA20"], r["SMA50"], r["SMA100"], r["SMA200"],
-            r["RSI14"], r["MACD"], r["MACD_signal"], r["ADX14"], r["ATR14"],
-            r["52W_High"], r["52W_Low"], r["Return20"], r["Return60"]
-        ]
-    })
-    st.dataframe(tech_table, use_container_width=True)
+    with tabs[2]:
+        st.markdown("### Quarterly income statement")
+        st.dataframe(data["quarterly_income"],use_container_width=True)
+        st.markdown("### Quarterly balance sheet")
+        st.dataframe(data["quarterly_balance"],use_container_width=True)
+        st.markdown("### Quarterly cash flow")
+        st.dataframe(data["quarterly_cashflow"],use_container_width=True)
 
-    st.markdown("### Technical interpretation")
-    for note in technical_notes:
-        st.write("• " + note)
+    with tabs[3]:
+        st.markdown("### Management / evidence discipline")
+        st.info(management["note"])
+        a,b=st.columns(2)
+        a.metric("Management score", "N/A")
+        b.metric("Evidence confidence", "LOW")
+        st.markdown("### Verified structured evidence")
+        for e in management["evidence"]: st.write("• "+e)
+        st.markdown("### Guidance tracker")
+        st.write("FY27 revenue guidance: Not verified")
+        st.write("FY27 EBITDA / margin guidance: Not verified")
+        st.write("FY28 revenue guidance: Not verified")
+        st.write("FY28 EBITDA / margin guidance: Not verified")
+        st.write("Order book / capex / capacity guidance: Not verified")
+        st.markdown("### What V2.3 should ingest")
+        st.write("NSE/BSE announcements, annual reports, investor presentations, earnings-call transcripts and company IR documents, with date/source citations and guidance-vs-actual tracking.")
 
-with tabs[5]:
-    st.markdown("### Risk-based position sizing")
+    with tabs[4]:
+        st.markdown("### Relative valuation")
+        st.dataframe(pd.DataFrame({"Metric":["Trailing P/E","Forward P/E","PEG","P/B","EV/EBITDA","P/S"],"Value":[fmt_num(valuation['pe']),fmt_num(valuation['forward_pe']),fmt_num(valuation['peg']),fmt_num(valuation['pb']),fmt_num(valuation['ev_ebitda']),fmt_num(valuation['ps'])]}),use_container_width=True,hide_index=True)
+        st.bar_chart(pd.Series(valuation["parts"],name="Valuation score"))
+        st.caption("No fabricated DCF is shown. A DCF requires explicit normalized earnings/cash-flow assumptions and scenarios.")
 
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("Entry/reference price", money(risk["price"]))
-    r2.metric("Suggested stop", money(risk["stop"]))
-    r3.metric("Max loss", money(risk["max_loss"]))
-    r4.metric("Risk / share", money(risk["risk_per_share"]))
+    with tabs[5]:
+        latest=tech.iloc[-1]
+        st.line_chart(tech[["Close","SMA20","SMA50","SMA100","SMA200"]].tail(300))
+        a,b,c,d,e=st.columns(5)
+        a.metric("RSI(14)",fmt_num(latest["RSI14"])); b.metric("ADX(14)",fmt_num(latest["ADX14"])); c.metric("ATR(14)",f"₹{fmt_num(latest['ATR14'])}"); d.metric("MACD",fmt_num(latest["MACD"],2)); e.metric("Volume ratio",fmt_num(latest["VolumeRatio"],2))
+        st.bar_chart(pd.Series(technical_components,name="Points"))
+        atr=safe_num(latest["ATR14"])
+        if not pd.isna(atr):
+            stop=price-1.5*atr; risk_per_share=max(price-stop,.01); risk_amount=capital*risk_pct/100; qty=int(risk_amount/risk_per_share); target1=price+2*risk_per_share; target2=price+3*risk_per_share
+            a,b,c,d=st.columns(4); a.metric("Illustrative stop",f"₹{stop:,.2f}"); b.metric("Risk budget",f"₹{risk_amount:,.0f}"); c.metric("Risk-based qty",f"{qty:,}"); d.metric("R:R targets",f"₹{target1:,.2f} / ₹{target2:,.2f}")
+            st.caption("Illustrative only; liquidity, gaps and slippage are not included.")
 
-    r5, r6, r7 = st.columns(3)
-    r5.metric("Suggested quantity", f"{risk['qty']:,}")
-    r6.metric("Capital deployed", money(risk["deployed"]))
-    r7.metric("Illustrative target", money(risk["target"]))
+    with tabs[6]:
+        st.markdown("### Automated red flags")
+        for x in flags: st.error("⚠ "+x)
+        if not flags: st.success("No major automated red flags triggered.")
+        st.markdown("### Positive catalysts / quality signals")
+        for x in positives: st.success("✓ "+x)
+        if not positives: st.write("None triggered.")
+        st.markdown("### Exchange / data caveats")
+        st.write("SME securities can have lower liquidity, larger spreads, market-maker/call-auction mechanics and shorter public operating histories. Position sizing should therefore use liquidity-aware limits rather than the mechanical ATR quantity alone.")
 
-    st.write(
-        f"Risk/reward framework: approximately **1:{risk['rr']:.1f}** "
-        f"for the selected **{objective}** objective."
-    )
+    with tabs[7]:
+        if data["news"]:
+            for n in data["news"]:
+                title=n.get("title") or "Untitled"; publisher=n.get("publisher") or ""; url=n.get("url")
+                st.markdown(f"**{title}** — {publisher}")
+                if url: st.markdown(f"[Open source]({url})")
+        else: st.info("No recent news was returned by the available Yahoo Finance feed.")
 
-    st.warning(
-        "Position sizing is a risk-control calculation, not a recommendation to buy. "
-        "Actual stop placement should be checked against chart structure/support."
-    )
+    with tabs[8]:
+        st.markdown("### Annual balance sheet"); st.dataframe(data["annual_balance"],use_container_width=True)
+        st.markdown("### Quarterly balance sheet"); st.dataframe(data["quarterly_balance"],use_container_width=True)
+        st.markdown("### Annual cash flow"); st.dataframe(data["annual_cashflow"],use_container_width=True)
+        st.markdown("### Quarterly cash flow"); st.dataframe(data["quarterly_cashflow"],use_container_width=True)
 
-with tabs[6]:
-    st.markdown("### Management / Evidence discipline")
+    st.divider()
+    st.caption("V2.2 is an analytical prototype, not investment advice. Exchange universe discovery uses official NSE/BSE sources; third-party financial data can be delayed, incomplete or unavailable for some SME securities. Verify material decisions against exchange/company filings.")
 
-    st.info(
-        "V2.1 does not manufacture management guidance. "
-        "Yahoo Finance/yfinance does not reliably provide complete earnings-call transcripts, "
-        "investor-presentation guidance or company-specific FY27/FY28 targets."
-    )
-
-    st.markdown("#### What is currently verified by structured data")
-    st.write("• Financial statements and market data returned by yfinance.")
-    st.write("• Current/last available price and technical indicators calculated from price history.")
-    st.write("• Valuation fields only where Yahoo Finance supplies them.")
-
-    st.markdown("#### What requires filing-level verification")
-    st.write("• FY27/FY28 revenue or EBITDA guidance")
-    st.write("• Order-book figures")
-    st.write("• Capacity expansion / capex commitments")
-    st.write("• Management commentary")
-    st.write("• New customer wins and project pipelines")
-    st.write("• Segment-level future targets")
-
-    st.warning(
-        "For serious investment decisions, use company annual reports, quarterly investor presentations, "
-        "earnings-call transcripts and NSE/BSE filings to supplement this screen."
-    )
-
-with tabs[7]:
-    st.markdown("### Recent news / evidence")
-    news = data.get("news", [])
-
-    if not news:
-        st.info("No recent news items were returned by the data source.")
-    else:
-        shown = 0
-        for item in news[:10]:
-            content = item.get("content", item)
-            if not isinstance(content, dict):
-                continue
-
-            title = content.get("title") or item.get("title") or "Untitled"
-            publisher = content.get("provider", {}).get("displayName", "") if isinstance(content.get("provider"), dict) else ""
-            link = content.get("canonicalUrl", {}).get("url", "") if isinstance(content.get("canonicalUrl"), dict) else content.get("link", "")
-
-            st.markdown(f"**{title}**")
-            if publisher:
-                st.caption(publisher)
-            if link:
-                st.markdown(f"[Open article]({link})")
-            shown += 1
-
-        if shown == 0:
-            st.info("News was returned but could not be parsed into displayable items.")
-
-# -----------------------------
-# Footer
-# -----------------------------
-
-st.divider()
-st.caption(
-    f"Indian Stock Intelligence V2.1 • Data checked: {datetime.now().strftime('%d-%b-%Y %H:%M')} • "
-    "Decision-support only; not investment advice."
-)
+except Exception as exc:
+    st.error(f"Could not analyse {stock}. Error: {type(exc).__name__}: {exc}")
+    st.exception(exc)
