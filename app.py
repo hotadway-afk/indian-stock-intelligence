@@ -9,14 +9,14 @@ import yfinance as yf
 from datetime import datetime
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V2.6",
+    page_title="Indian Stock Intelligence V2.7",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ============================================================
-# V2.6: Exchange-first market-data architecture
+# V2.7: Exchange-first market-data architecture
 # NSE + BSE + NSE Emerge + BSE SME security resolver
 # Market-data priority: NSE/BSE exchange data -> optional yfinance fallback.
 # Coverage targets:
@@ -311,7 +311,7 @@ def resolve_security(query,exchange_choice,universe):
         matches=matches.sort_values("_rank",ascending=False).drop(columns="_rank")
         return matches.iloc[0].to_dict(),matches.head(25)
 
-    # Critical V2.6 change: direct BSE resolution is attempted even when the
+    # Critical V2.7 change: direct BSE resolution is attempted even when the
     # bulk BSE universe is empty. This prevents provider/master failures from
     # being misreported as "unlisted".
     if exchange_choice in ("All Exchanges","BSE","BSE SME"):
@@ -327,7 +327,7 @@ def resolve_security(query,exchange_choice,universe):
 
 
 def yahoo_ticker_for(sec):
-    """Legacy fallback ticker only. Exchange data is preferred in V2.6."""
+    """Legacy fallback ticker only. Exchange data is preferred in V2.7."""
     exchange = str(sec.get("exchange", "NSE")).upper()
     symbol = str(sec.get("symbol", "")).strip().upper()
     code = str(sec.get("bse_code", "")).strip()
@@ -469,85 +469,150 @@ def _parse_bse_chart_date(value):
     return pd.to_datetime(text, errors="coerce")
 
 
+def _decode_bse_chart_payload(payload):
+    """Normalize the BSE charting response into daily OHLCV."""
+    outer = payload if isinstance(payload, dict) else {}
+    inner = outer.get("getDatResult")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except Exception:
+            inner = None
+    if not isinstance(inner, dict):
+        inner = outer
+
+    # Some versions expose timestamp arrays directly.
+    if all(k in inner for k in ("t", "o", "h", "l", "c", "v")):
+        out = pd.DataFrame({
+            "Date": pd.to_datetime(inner["t"], unit="s", errors="coerce"),
+            "Open": pd.to_numeric(inner["o"], errors="coerce"),
+            "High": pd.to_numeric(inner["h"], errors="coerce"),
+            "Low": pd.to_numeric(inner["l"], errors="coerce"),
+            "Close": pd.to_numeric(inner["c"], errors="coerce"),
+            "Volume": pd.to_numeric(inner["v"], errors="coerce"),
+        })
+        return out
+
+    divs = inner.get("DataInputValues")
+    if isinstance(divs, str):
+        try:
+            divs = json.loads(divs)
+        except Exception:
+            divs = None
+    if not divs:
+        return pd.DataFrame()
+
+    d = divs[0] if isinstance(divs, list) else divs
+    if not isinstance(d, dict):
+        return pd.DataFrame()
+
+    def array_values(field, aliases):
+        arr = d.get(field, [])
+        if not arr:
+            for alias in aliases:
+                arr = d.get(alias, [])
+                if arr:
+                    break
+        vals=[]
+        for x in arr or []:
+            if isinstance(x, dict):
+                # BSE has returned both Date/Open/etc and Value variants.
+                value = None
+                for k in aliases:
+                    if k in x:
+                        value = x.get(k); break
+                if value is None:
+                    for k in [field, field.replace("Data", "")]:
+                        if k in x:
+                            value = x.get(k); break
+                vals.append(value)
+            else:
+                vals.append(x)
+        return vals
+
+    dates = array_values("DateData", ["Date", "D"])
+    opens = array_values("OpenData", ["Open", "O"])
+    highs = array_values("HighData", ["High", "H"])
+    lows = array_values("LowData", ["Low", "L"])
+    closes = array_values("CloseData", ["Close", "C"])
+    vols = array_values("VolumeData", ["Volume", "V"])
+
+    n = min(len(dates), len(opens), len(highs), len(lows), len(closes), len(vols))
+    if n == 0:
+        return pd.DataFrame()
+
+    return pd.DataFrame({
+        "Date": [_parse_bse_chart_date(x) for x in dates[:n]],
+        "Open": pd.to_numeric(opens[:n], errors="coerce"),
+        "High": pd.to_numeric(highs[:n], errors="coerce"),
+        "Low": pd.to_numeric(lows[:n], errors="coerce"),
+        "Close": pd.to_numeric(closes[:n], errors="coerce"),
+        "Volume": pd.to_numeric(vols[:n], errors="coerce"),
+    })
+
+
 def _bse_chart_history(code):
-    """Fetch BSE daily OHLCV from BSE's charting service.
+    """Fetch BSE daily OHLCV using the public charting service.
 
-    This is intentionally separate from the T12M endpoint. BSE's charting
-    service returns OHLCV arrays and is suitable for technical indicators.
+    V2.7 uses GET first (the endpoint is exposed as an HTTP GET by BSE-facing
+    implementations), then retries with POST for compatibility. The response
+    parser accepts both the standard DataInputValues structure and direct arrays.
     """
-    code=str(code or "").strip()
+    code = str(code or "").strip()
     if not re.fullmatch(r"\d{5,6}", code):
-        return pd.DataFrame()
-    try:
-        params={
-            "exch":"B",
-            "type":"b",
-            "mode":"bseL",
-            "fromdate":"01-01-1991-01:01:00-AM",
-            "scode":code,
-        }
-        h={**REQUEST_HEADERS,"Origin":"https://www.bseindia.com","Accept":"application/json, text/plain, */*"}
-        r=requests.post(BSE_CHART_API,params=params,headers=h,data="",timeout=30)
-        if not r.ok or not r.text.strip():
-            return pd.DataFrame()
-        outer=r.json()
-        inner=outer.get("getDatResult") if isinstance(outer,dict) else None
-        if isinstance(inner,str):
-            try: inner=json.loads(inner)
-            except Exception: return pd.DataFrame()
-        if not isinstance(inner,dict):
-            inner=outer if isinstance(outer,dict) else {}
+        return pd.DataFrame(), "invalid BSE code"
 
-        # Some BSE responses expose TradingView-like arrays directly.
-        if all(k in inner for k in ("t","o","h","l","c","v")):
-            out=pd.DataFrame({
-                "Date":pd.to_datetime(inner["t"],unit="s",errors="coerce"),
-                "Open":pd.to_numeric(inner["o"],errors="coerce"),
-                "High":pd.to_numeric(inner["h"],errors="coerce"),
-                "Low":pd.to_numeric(inner["l"],errors="coerce"),
-                "Close":pd.to_numeric(inner["c"],errors="coerce"),
-                "Volume":pd.to_numeric(inner["v"],errors="coerce"),
-            })
-        else:
-            divs=inner.get("DataInputValues",[])
-            if not divs: return pd.DataFrame()
-            d=divs[0] if isinstance(divs,list) else divs
-            def arr(name,key):
-                a=d.get(name,[]) if isinstance(d,dict) else []
-                vals=[]
-                for x in a:
-                    if isinstance(x,dict): vals.append(x.get(key))
-                    else: vals.append(x)
-                return vals
-            dates=arr("DateData","Date")
-            opens=arr("OpenData","Open")
-            highs=arr("HighData","High")
-            lows=arr("LowData","Low")
-            closes=arr("CloseData","Close")
-            vols=arr("VolumeData","Volume")
-            n=min(len(dates),len(opens),len(highs),len(lows),len(closes),len(vols))
-            if n==0: return pd.DataFrame()
-            out=pd.DataFrame({
-                "Date":[_parse_bse_chart_date(x) for x in dates[:n]],
-                "Open":pd.to_numeric(opens[:n],errors="coerce"),
-                "High":pd.to_numeric(highs[:n],errors="coerce"),
-                "Low":pd.to_numeric(lows[:n],errors="coerce"),
-                "Close":pd.to_numeric(closes[:n],errors="coerce"),
-                "Volume":pd.to_numeric(vols[:n],errors="coerce"),
-            })
-        out=out.dropna(subset=["Date","Close"]).set_index("Date").sort_index()
-        if out.empty: return pd.DataFrame()
-        out["Adj Close"]=out["Close"]
-        return out[["Open","High","Low","Close","Adj Close","Volume"]]
-    except Exception:
-        return pd.DataFrame()
+    params = {
+        "exch": "B",
+        "type": "b",
+        "mode": "bseL",
+        "fromdate": "01-01-1991-01:01:00-AM",
+        "scode": code,
+    }
+    headers = {
+        **REQUEST_HEADERS,
+        "Origin": "https://www.bseindia.com",
+        "Accept": "application/json, text/plain, */*",
+    }
+    errors=[]
+
+    for method in ("get", "post"):
+        try:
+            if method == "get":
+                r = requests.get(BSE_CHART_API, params=params, headers=headers, timeout=30)
+            else:
+                r = requests.post(BSE_CHART_API, params=params, headers=headers, data="", timeout=30)
+            if not r.ok:
+                errors.append(f"{method.upper()} HTTP {r.status_code}")
+                continue
+            if not r.text.strip():
+                errors.append(f"{method.upper()} empty response")
+                continue
+            try:
+                payload = r.json()
+            except Exception as exc:
+                errors.append(f"{method.upper()} non-JSON: {type(exc).__name__}")
+                continue
+            out = _decode_bse_chart_payload(payload)
+            if not out.empty:
+                out = out.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
+                if not out.empty:
+                    out["Adj Close"] = out["Close"]
+                    return out[["Open","High","Low","Close","Adj Close","Volume"]], f"BSE charting API ({method.upper()})"
+            errors.append(f"{method.upper()} parsed 0 rows")
+        except Exception as exc:
+            errors.append(f"{method.upper()} {type(exc).__name__}: {exc}")
+
+    return pd.DataFrame(), "; ".join(errors)[:500]
 
 
 def bse_history_fallback(code):
     """Best-effort BSE history: charting OHLCV first, T12M second."""
-    chart=_bse_chart_history(code)
+    chart, chart_status = _bse_chart_history(code)
     if not chart.empty:
-        return chart
+        return chart, chart_status
+
+    errors = [chart_status]
     try:
         r = requests.get(
             f"{BSE_API}/EquityPriceVolumeT12M/w",
@@ -556,26 +621,34 @@ def bse_history_fallback(code):
             timeout=20,
         )
         if not r.ok:
-            return pd.DataFrame()
-        payload = r.json()
-        data = payload.get("Data", {})
-        rows = data.get("data", []) if isinstance(data, dict) else []
-        if not rows:
-            return pd.DataFrame()
-        fields = data.get("fields", ["dttm", "vale1", "vole"])
-        df = pd.DataFrame(rows, columns=fields[:len(rows[0])])
-        date_col, price_col = fields[0], fields[1]
-        vol_col = fields[2] if len(fields) > 2 else None
-        out = pd.DataFrame(index=pd.to_datetime(df[date_col], errors="coerce"))
-        out["Close"] = pd.to_numeric(df[price_col], errors="coerce")
-        out["Open"] = out["Close"]
-        out["High"] = out["Close"]
-        out["Low"] = out["Close"]
-        out["Adj Close"] = out["Close"]
-        out["Volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else 0
-        return out.dropna(subset=["Close"]).sort_index()
-    except Exception:
-        return pd.DataFrame()
+            errors.append(f"T12M HTTP {r.status_code}")
+        else:
+            payload = r.json()
+            data = payload.get("Data", {}) if isinstance(payload, dict) else {}
+            if isinstance(data, str):
+                try: data = json.loads(data)
+                except Exception: data = {}
+            rows = data.get("data", []) if isinstance(data, dict) else []
+            if rows:
+                fields = data.get("fields", ["dttm", "vale1", "vole"])
+                df = pd.DataFrame(rows, columns=fields[:len(rows[0])])
+                date_col, price_col = fields[0], fields[1]
+                vol_col = fields[2] if len(fields) > 2 else None
+                out = pd.DataFrame(index=pd.to_datetime(df[date_col], errors="coerce"))
+                out["Close"] = pd.to_numeric(df[price_col], errors="coerce")
+                out["Open"] = out["Close"]
+                out["High"] = out["Close"]
+                out["Low"] = out["Close"]
+                out["Adj Close"] = out["Close"]
+                out["Volume"] = pd.to_numeric(df[vol_col], errors="coerce") if vol_col else 0
+                out = out.dropna(subset=["Close"]).sort_index()
+                if not out.empty:
+                    return out, "BSE T12M API"
+            errors.append("T12M parsed 0 rows")
+    except Exception as exc:
+        errors.append(f"T12M {type(exc).__name__}: {exc}")
+    return pd.DataFrame(), "; ".join([str(x) for x in errors if x])[:500]
+
 
 def _clean_yf_history(hist):
     if hist is None or hist.empty:
@@ -595,7 +668,7 @@ def _clean_yf_history(hist):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(sec):
-    """V2.6 exchange-first data layer.
+    """V2.7 exchange-first data layer.
 
     Priority for OHLCV:
       1) NSE public historical API for NSE / NSE Emerge
@@ -620,10 +693,10 @@ def load_stock(sec):
         hist, provider = nse_history(symbol, series=series, years=5)
         provider_chain.append("NSE public API")
     elif exchange == "BSE" and code and code.upper() not in {"NAN", "NONE"}:
-        hist = bse_history_fallback(code)
-        provider = "BSE public charting API"
-        history_period = "available BSE history"
-        provider_chain.append("BSE charting API → BSE T12M")
+        hist, bse_status = bse_history_fallback(code)
+        provider = "BSE charting/T12M API" if not hist.empty else "Unavailable"
+        history_period = "available BSE history" if not hist.empty else "—"
+        provider_chain.append("BSE charting API (GET/POST) → BSE T12M")
 
     # Legacy fallback only after exchange data has failed.
     ticker_symbol = yahoo_ticker_for(sec)
@@ -699,8 +772,9 @@ def load_stock(sec):
     info["providerTicker"] = ticker_symbol
     info["dataProvider"] = provider
     info["providerChain"] = " → ".join(provider_chain)
+    info["providerStatus"] = locals().get("bse_status", "")
     info["historyPeriod"] = history_period
-    info["dataQuality"] = "HIGH" if provider in {"NSE public API", "BSE public data"} and len(hist) >= 200 else ("MEDIUM" if not hist.empty else "LOW")
+    info["dataQuality"] = "HIGH" if provider in {"NSE public API", "BSE charting/T12M API"} and len(hist) >= 200 else ("MEDIUM" if not hist.empty else "LOW")
 
     return {
         "hist": hist,
@@ -845,14 +919,14 @@ def management_engine(sec, info):
         "confidence": "LOW — filing-level management evidence not ingested",
         "evidence": evidence,
         "guidance": "Not verified",
-        "note": "V2.6 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
+        "note": "V2.7 does not manufacture FY27/FY28 guidance. Add NSE/BSE filings, investor presentations and earnings-call transcripts for a company-specific management score."
     }
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V2.6")
+st.title("📊 Indian Stock Intelligence — V2.7")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -864,10 +938,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V2.6 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V2.7 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.6 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V2.7 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -877,21 +951,21 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V2.6 coverage")
+    st.markdown("### V2.7 coverage")
     st.markdown("- NSE Main Board")
     st.markdown("- NSE Emerge / SME")
     st.markdown("- BSE Main Board — all active equity groups")
     st.markdown("- BSE SME — M / MT / MS / TS groups")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
     st.markdown("- Exchange data first (NSE/BSE); yfinance only as legacy fallback")
-    st.caption("V2.6 separates exchange identity from provider coverage. BSE direct identity resolution is attempted even if the bulk BSE master endpoint is unavailable.")
+    st.caption("V2.7 separates exchange identity from provider coverage. BSE direct identity resolution is attempted even if the bulk BSE master endpoint is unavailable.")
     st.stop()
 
 try:
     sec, matches = resolve_security(stock, exchange_choice, universe)
     if sec is None:
         st.error(f"Could not resolve '{stock}' in the selected exchange/segment universe.")
-        st.info("V2.6 checks the exchange universe first and then attempts direct BSE identity resolution. If this still fails, the exchange provider did not return a usable identity for the input.")
+        st.info("V2.7 checks the exchange universe first and then attempts direct BSE identity resolution. If this still fails, the exchange provider did not return a usable identity for the input.")
         if not matches.empty:
             st.dataframe(matches[["exchange","segment","symbol","company","isin","bse_code","source"]] if "source" in matches.columns else matches[["exchange","segment","symbol","company","isin","bse_code"]], use_container_width=True, hide_index=True)
         st.stop()
@@ -905,9 +979,10 @@ try:
 
     hist = data["hist"]; info = data["info"]
     if hist.empty:
-        st.error("The security was resolved from the exchange universe, but no usable historical market-data series was returned by NSE/BSE or the legacy fallback.")
+        st.error("The security was resolved, but the available public market-data providers returned no usable OHLCV history.")
         st.warning("This is a market-data coverage limitation — NOT a statement that the company is unlisted.")
-        st.dataframe(pd.DataFrame([{"Exchange":sec.get("exchange"),"Segment":sec.get("segment"),"Symbol":sec.get("symbol"),"BSE code":sec.get("bse_code"),"ISIN":sec.get("isin"),"Legacy fallback ticker":info.get("providerTicker"),"Universe source":sec.get("source")}]),use_container_width=True,hide_index=True)
+        st.dataframe(pd.DataFrame([{"Exchange":sec.get("exchange"),"Segment":sec.get("segment"),"Symbol":sec.get("symbol"),"BSE code":sec.get("bse_code"),"ISIN":sec.get("isin"),"Legacy fallback ticker":info.get("providerTicker"),"Universe source":sec.get("source"),"Provider diagnostic":info.get("providerStatus")}]),use_container_width=True,hide_index=True)
+        st.info("Next layer: use a licensed exchange/broker historical-data API for securities not covered by the public endpoints. V2.7 will not fabricate technical indicators.")
         st.stop()
 
     tech, technical_score, technical_components = technical_engine(hist)
@@ -943,7 +1018,7 @@ try:
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
         if sec.get("segment_note"): st.warning(sec.get("segment_note"))
-        st.caption("Exchange identity is authoritative. V2.6 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
+        st.caption("Exchange identity is authoritative. V2.7 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -951,10 +1026,11 @@ try:
             "History available": f"{len(data.get('hist', pd.DataFrame())):,} sessions",
             "History period": data.get("history_period"),
             "Data quality": info.get("dataQuality", "LOW"),
+            "Provider diagnostic": info.get("providerStatus") or "No provider error returned.",
         })
 
     cols=st.columns(6)
-    cols[0].metric("V2.6 Score", f"{overall:.0f}/100")
+    cols[0].metric("V2.7 Score", f"{overall:.0f}/100")
     cols[1].metric("Fundamental", f"{fundamental['score']:.0f}")
     cols[2].metric("Management", "N/A")
     cols[3].metric("Valuation", f"{valuation['score']:.0f}")
@@ -1014,7 +1090,7 @@ try:
         st.write("FY28 revenue guidance: Not verified")
         st.write("FY28 EBITDA / margin guidance: Not verified")
         st.write("Order book / capex / capacity guidance: Not verified")
-        st.markdown("### What V2.6 should ingest")
+        st.markdown("### What V2.7 should ingest")
         st.write("NSE/BSE announcements, annual reports, investor presentations, earnings-call transcripts and company IR documents, with date/source citations and guidance-vs-actual tracking.")
 
     with tabs[4]:
@@ -1061,7 +1137,7 @@ try:
         st.markdown("### Quarterly cash flow"); st.dataframe(data["quarterly_cashflow"],use_container_width=True)
 
     st.divider()
-    st.caption("V2.6 is an analytical prototype, not investment advice. Exchange identity and security masters are sourced from official exchange endpoints where available; free market-data providers can be incomplete, especially for SME securities. Verify material decisions against exchange/company filings.")
+    st.caption("V2.7 is an analytical prototype, not investment advice. Exchange identity and security masters are sourced from official exchange endpoints where available; free market-data providers can be incomplete, especially for SME securities. Verify material decisions against exchange/company filings.")
 
 except Exception as exc:
     st.error(f"Could not analyse {stock}. Error: {type(exc).__name__}: {exc}")
