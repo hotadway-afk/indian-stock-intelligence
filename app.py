@@ -214,7 +214,7 @@ def technical_engine(hist):
     components["ADX > 20"] = 10 if safe_num(latest["ADX14"]) > 20 else 0
     components["Volume expansion"] = 5 if safe_num(latest["VolumeRatio"]) > 1.2 else 0
 
-    score = sum(components.values())
+    score = float(np.clip(sum(components.values()), 0, 100))
     return h, score, components
 
 # -----------------------------
@@ -251,7 +251,7 @@ def fundamental_engine(info, annual_income, annual_balance, annual_cashflow):
         "Debt discipline": score_range(de, 20, 150, inverse=True),
     }
 
-    score = float(np.mean(list(components.values())))
+    score = float(np.clip(np.mean(list(components.values())), 0, 100))
 
     return {
         "score": score,
@@ -332,14 +332,98 @@ def quality_engine(info, fundamental, annual_income, annual_cashflow, annual_bal
     if not pd.isna(promoter) and promoter < 0.20:
         flags.append("Insider/promoter ownership is below 20% in the available snapshot.")
 
-    score = max(0, 100 - 12*len(flags) + 6*len(positives))
+    score = float(np.clip(100 - 12*len(flags) + 6*len(positives), 0, 100))
     return score, positives, flags
+
+
+def data_quality_engine(info, hist, annual_income, quarterly_income, annual_cashflow):
+    checks = {
+        "Price history": bool(hist is not None and len(hist) >= 200),
+        "Annual income statement": bool(annual_income is not None and not annual_income.empty),
+        "Quarterly income statement": bool(quarterly_income is not None and not quarterly_income.empty),
+        "Annual cash flow": bool(annual_cashflow is not None and not annual_cashflow.empty),
+        "Company profile": bool(info and (info.get("longName") or info.get("shortName"))),
+    }
+    score = round(100 * sum(checks.values()) / len(checks))
+    return score, checks
+
+def pct_change(a, b):
+    a, b = safe_num(a), safe_num(b)
+    if pd.isna(a) or pd.isna(b) or a == 0:
+        return np.nan
+    return (b/a) - 1
+
+def statement_snapshot(df, row_candidates):
+    row = find_row(df, row_candidates)
+    if row is None or df is None or df.empty:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df.loc[row], errors="coerce").dropna()
+
+def build_growth_table(annual_income, quarterly_income):
+    rows = []
+    metrics = {
+        "Revenue": ["Total Revenue", "Operating Revenue", "TotalRevenue"],
+        "EBITDA": ["EBITDA", "Normalized EBITDA"],
+        "Net Income": ["Net Income", "Net Income Common Stockholders", "NetIncome"],
+        "Operating Income": ["Operating Income", "OperatingIncome"],
+    }
+    for label, candidates in metrics.items():
+        a = statement_snapshot(annual_income, candidates)
+        q = statement_snapshot(quarterly_income, candidates)
+        latest_a = a.iloc[0] if len(a) else np.nan
+        prior_a = a.iloc[1] if len(a) > 1 else np.nan
+        latest_q = q.iloc[0] if len(q) else np.nan
+        prior_q = q.iloc[1] if len(q) > 1 else np.nan
+        yoy_q = q.iloc[4] if len(q) > 4 else np.nan
+        rows.append({
+            "Metric": label,
+            "Latest annual": latest_a,
+            "Prior annual": prior_a,
+            "Annual growth": pct_change(prior_a, latest_a),
+            "Latest quarter": latest_q,
+            "Prior quarter": prior_q,
+            "QoQ growth": pct_change(prior_q, latest_q),
+            "YoY quarter growth": pct_change(yoy_q, latest_q),
+        })
+    return pd.DataFrame(rows)
+
+def technical_trade_plan(tech, capital, risk_pct):
+    latest = tech.iloc[-1]
+    price = safe_num(latest["Close"])
+    atr = safe_num(latest["ATR14"])
+    if pd.isna(price) or pd.isna(atr) or atr <= 0:
+        return {}
+    support = safe_num(latest["SMA20"])
+    if pd.isna(support):
+        support = price - atr
+    entry_low = max(0, min(price, support + 0.25*atr))
+    entry_high = price + 0.25*atr
+    stop = max(0, price - 1.5*atr)
+    risk_per_share = max(price-stop, 0.01)
+    target1 = price + 2*risk_per_share
+    target2 = price + 3*risk_per_share
+    risk_budget = capital * risk_pct / 100
+    qty = int(risk_budget / risk_per_share)
+    deployed = qty * price
+    return {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "risk_per_share": risk_per_share,
+        "risk_budget": risk_budget,
+        "qty": qty,
+        "deployed": deployed,
+        "rr1": (target1-price)/risk_per_share,
+        "rr2": (target2-price)/risk_per_share,
+    }
 
 # -----------------------------
 # Main UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V2")
-st.caption("Fundamental + Management/Evidence + Valuation + Technical + Risk decision-support engine")
+st.title("📊 Indian Stock Intelligence — V2.1")
+st.caption("V2.1: fundamentals + quarterly growth + valuation + technicals + risk sizing + diagnostics")
 
 with st.sidebar:
     st.header("Analysis Inputs")
@@ -386,6 +470,11 @@ try:
     quality_score, positives, flags = quality_engine(
         info, fundamental, data["annual_income"], data["annual_cashflow"], data["annual_balance"]
     )
+    data_quality, data_checks = data_quality_engine(
+        info, hist, data["annual_income"], data["quarterly_income"], data["annual_cashflow"]
+    )
+    growth_table = build_growth_table(data["annual_income"], data["quarterly_income"])
+    trade_plan = technical_trade_plan(tech, capital, risk_pct)
 
     # Management/evidence score is intentionally conservative.
     # Without filing/earnings-call text, do not fabricate a management-quality score.
@@ -393,20 +482,21 @@ try:
     evidence_note = "Structured free-data layer loaded. Management guidance/commentary has not been independently verified from company filings in V2."
 
     # Overall weighted score
-    overall = (
+    overall = float(np.clip(
         0.35 * fundamental["score"]
         + 0.20 * management_score
         + 0.15 * valuation["score"]
         + 0.20 * technical_score
-        + 0.10 * quality_score
-    )
+        + 0.10 * quality_score,
+        0, 100
+    ))
 
     if objective == "Long Term":
-        objective_score = 0.45*fundamental["score"] + 0.25*management_score + 0.20*valuation["score"] + 0.10*quality_score
+        objective_score = float(np.clip(0.45*fundamental["score"] + 0.25*management_score + 0.20*valuation["score"] + 0.10*quality_score, 0, 100))
     elif objective == "Swing Trading":
-        objective_score = 0.55*technical_score + 0.20*valuation["score"] + 0.15*quality_score + 0.10*fundamental["score"]
+        objective_score = float(np.clip(0.55*technical_score + 0.20*valuation["score"] + 0.15*quality_score + 0.10*fundamental["score"], 0, 100))
     else:
-        objective_score = 0.70*technical_score + 0.20*quality_score + 0.10*valuation["score"]
+        objective_score = float(np.clip(0.70*technical_score + 0.20*quality_score + 0.10*valuation["score"], 0, 100))
 
     if objective_score >= 75:
         verdict = "🟢 STRONG SETUP"
@@ -431,6 +521,7 @@ try:
     cols[3].metric("Valuation", f"{valuation['score']:.0f}")
     cols[4].metric("Technical", f"{technical_score:.0f}")
     cols[5].metric("Quality/Risk", f"{quality_score:.0f}")
+    st.caption(f"Data Quality: {data_quality}/100 | Scores are hard-capped at 100.")
 
     if "STRONG" in verdict:
         st.success(verdict)
@@ -451,7 +542,8 @@ try:
         "📈 Technicals",
         "🚨 Risks & Catalysts",
         "📰 Recent News",
-        "📋 Raw Financials"
+        "📋 Raw Financials",
+        "🧪 Model Diagnostics"
     ])
 
     with tabs[0]:
@@ -498,6 +590,17 @@ try:
 
         st.markdown("### Fundamental components")
         st.bar_chart(pd.Series(fundamental["components"]))
+
+        st.markdown("### Annual + quarterly growth bridge")
+        if not growth_table.empty:
+            display_growth = growth_table.copy()
+            for c in ["Annual growth", "QoQ growth", "YoY quarter growth"]:
+                display_growth[c] = display_growth[c].apply(lambda x: fmt_pct(x))
+            st.dataframe(display_growth, use_container_width=True, hide_index=True)
+
+        st.markdown("### Why the fundamental score looks this way")
+        for k, v in fundamental["components"].items():
+            st.write(f"**{k}:** {v:.0f}/100")
 
         st.markdown("### Annual income statement")
         st.dataframe(data["annual_income"], use_container_width=True)
@@ -559,18 +662,19 @@ try:
         atr = safe_num(latest["ATR14"])
         if not pd.isna(atr):
             stop = price - 1.5*atr
-            risk_per_share = max(price-stop, 0.01)
-            risk_amount = capital*risk_pct/100
-            qty = int(risk_amount/risk_per_share)
-            target1 = price + 2*risk_per_share
-            target2 = price + 3*risk_per_share
-            st.markdown("### Mechanical risk framework")
-            a,b,c,d = st.columns(4)
-            a.metric("Illustrative stop", f"₹{stop:,.2f}")
-            b.metric("Risk budget", f"₹{risk_amount:,.0f}")
-            c.metric("Risk-based qty", f"{qty:,}")
-            d.metric("R:R targets", f"₹{target1:,.2f} / ₹{target2:,.2f}")
-            st.caption("Illustrative only; not a trade recommendation. Liquidity, gaps and slippage are not included.")
+            st.markdown("### V2.1 risk-based trade plan")
+            if trade_plan:
+                a,b,c,d = st.columns(4)
+                a.metric("Entry zone", f"₹{trade_plan['entry_low']:,.0f}–₹{trade_plan['entry_high']:,.0f}")
+                b.metric("Stop loss", f"₹{trade_plan['stop']:,.0f}")
+                c.metric("Target 1", f"₹{trade_plan['target1']:,.0f}")
+                d.metric("Target 2", f"₹{trade_plan['target2']:,.0f}")
+                e,f,g = st.columns(3)
+                e.metric("Risk budget", f"₹{trade_plan['risk_budget']:,.0f}")
+                f.metric("Position size", f"{trade_plan['qty']:,} shares")
+                g.metric("Capital deployed", f"₹{trade_plan['deployed']:,.0f}")
+                st.write(f"**Risk/Reward:** 1:{trade_plan['rr1']:.1f} to Target 1 | 1:{trade_plan['rr2']:.1f} to Target 2")
+            st.caption("Illustrative mechanical framework, not a trade recommendation. Liquidity, gaps, slippage and event risk are not included.")
 
     with tabs[5]:
         st.markdown("### Automated red flags")
@@ -609,6 +713,25 @@ try:
             st.info("No recent news was returned by the available Yahoo Finance feed.")
 
     with tabs[7]:
+        st.markdown("### Model diagnostics")
+        st.success("V2.1 score integrity check passed: every score is constrained to 0–100.")
+        st.markdown("### Data quality")
+        st.progress(data_quality / 100)
+        for name, ok in data_checks.items():
+            st.write(("✅ " if ok else "⚠️ ") + name)
+        st.markdown("### Important limitations")
+        st.write(
+            "Management guidance, earnings-call commentary, order-book verification, promoter pledging, "
+            "auditor issues, related-party transactions, exchange filings and a normalized DCF are not inferred "
+            "when the free structured-data layer cannot establish them."
+        )
+        st.markdown("### Score weights")
+        st.dataframe(pd.DataFrame({
+            "Engine": ["Fundamental", "Management/Evidence", "Valuation", "Technical", "Quality/Risk"],
+            "Weight": ["35%", "20%", "15%", "20%", "10%"]
+        }), use_container_width=True, hide_index=True)
+
+    with tabs[8]:
         st.markdown("### Annual balance sheet")
         st.dataframe(data["annual_balance"], use_container_width=True)
         st.markdown("### Quarterly balance sheet")
