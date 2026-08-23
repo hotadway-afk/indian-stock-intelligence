@@ -15,7 +15,7 @@ except Exception:
     PdfReader = None
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V3.0",
+    page_title="Indian Stock Intelligence V3.0.1",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -984,7 +984,7 @@ def management_evidence_engine(sec, info, docs):
         "findings": findings,
         "guidance": "Needs document verification",
         "note": (
-            "V3.0 separates evidence availability from management quality. "
+            "V3.0.1 separates evidence availability from management quality. "
             "It will not convert missing guidance into a neutral 50/100 management score. "
             "Upload an annual report, investor presentation or earnings-call transcript "
             "to extract company-specific guidance, capex, order-book and outlook evidence."
@@ -1012,7 +1012,7 @@ def source_links(sec):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V3.0")
+st.title("📊 Indian Stock Intelligence — V3.0.1")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -1042,10 +1042,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V3.0 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V3.0.1 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.0 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.0.1 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -1055,7 +1055,7 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V3.0 coverage")
+    st.markdown("### V3.0.1 coverage")
     st.markdown("- NSE Main Board + NSE Emerge / SME")
     st.markdown("- BSE Main Board + BSE SME")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
@@ -1063,7 +1063,7 @@ if not run:
     st.markdown("- Fundamentals and valuation can continue even if technical history is unavailable")
     st.markdown("- Optional annual-report / investor-presentation / transcript evidence extraction")
     st.caption(
-        "V3.0 separates security identity, market-data availability and research evidence. "
+        "V3.0.1 separates security identity, market-data availability and research evidence. "
         "Technical analysis is optional; research analysis can continue when OHLCV is unavailable."
     )
     st.stop()
@@ -1146,14 +1146,8 @@ try:
         + (technical_score if not pd.isna(technical_score) else 0) * obj_weights.get("technical", 0)
         + quality_score * obj_weights.get("quality", 0)
     )
-
-    overall = 0.35*fundamental["score"] + 0.20*management_display + 0.15*valuation["score"] + 0.20*technical_score + 0.10*quality_score
-    if objective == "Long Term":
-        objective_score = 0.45*fundamental["score"] + 0.25*management_display + 0.20*valuation["score"] + 0.10*quality_score
-    elif objective == "Swing Trading":
-        objective_score = 0.55*technical_score + 0.20*valuation["score"] + 0.15*quality_score + 0.10*fundamental["score"]
-    else:
-        objective_score = 0.70*technical_score + 0.20*quality_score + 0.10*valuation["score"]
+    overall = float(np.clip(overall, 0, 100))
+    objective_score = float(np.clip(objective_score, 0, 100))
 
     if objective_score >= 75: verdict="🟢 STRONG SETUP"
     elif objective_score >= 60: verdict="🟡 SELECTIVE / WATCH"
@@ -1161,10 +1155,15 @@ try:
     else: verdict="🔴 AVOID / HIGH RISK"
 
     company = info.get("longName") or sec.get("company") or stock
-    price = safe_num(tech.iloc[-1]["Close"])
-    high52 = safe_num(info.get("fiftyTwoWeekHigh")); low52 = safe_num(info.get("fiftyTwoWeekLow"))
-    if pd.isna(high52) and not pd.isna(price): high52 = safe_num(tech["High"].tail(252).max())
-    if pd.isna(low52) and not pd.isna(price): low52 = safe_num(tech["Low"].tail(252).min())
+    if hist.empty:
+        price = safe_num(info.get("currentPrice"))
+        high52 = safe_num(info.get("fiftyTwoWeekHigh"))
+        low52 = safe_num(info.get("fiftyTwoWeekLow"))
+    else:
+        price = safe_num(tech.iloc[-1]["Close"])
+        high52 = safe_num(info.get("fiftyTwoWeekHigh")); low52 = safe_num(info.get("fiftyTwoWeekLow"))
+        if pd.isna(high52): high52 = safe_num(tech["High"].tail(252).max())
+        if pd.isna(low52): low52 = safe_num(tech["Low"].tail(252).min())
 
     st.subheader(f"{company} ({sec.get('symbol') or stock})")
     st.caption(f"{sec.get('exchange')} • {sec.get('segment')} • BSE code: {sec.get('bse_code') or '—'} • ISIN: {sec.get('isin') or '—'} • Universe: {sec.get('source') or '—'} • Data: {data['provider']} ({data['history_period']})")
@@ -1345,7 +1344,7 @@ try:
 
     st.divider()
     st.caption(
-    "V3.0 is an analytical prototype, not investment advice. No broker account is required. "
+    "V3.0.1 is an analytical prototype, not investment advice. No broker account is required. "
     "Exchange identity is kept separate from market-data availability; public data can still be incomplete, "
     "especially for SME securities. Verify material decisions against exchange/company filings."
 )
