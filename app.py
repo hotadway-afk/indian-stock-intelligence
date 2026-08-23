@@ -497,7 +497,7 @@ try:
         }), use_container_width=True, hide_index=True)
 
         st.markdown("### Fundamental components")
-        st.bar_chart(pd.Series(fundamental["components"], name="Score"))
+        st.bar_chart(pd.Series(fundamental["components"]))
 
         st.markdown("### Annual income statement")
         st.dataframe(data["annual_income"], use_container_width=True)
