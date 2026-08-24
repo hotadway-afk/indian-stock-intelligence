@@ -15,7 +15,7 @@ except Exception:
     PdfReader = None
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V3.0.1",
+    page_title="Indian Stock Intelligence V3.1",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1300,7 +1300,7 @@ def management_evidence_engine(sec, info, docs):
         "findings": findings,
         "guidance": "Needs document verification",
         "note": (
-            "V3.0.1 separates evidence availability from management quality. "
+            "V3.1 separates evidence availability from management quality. "
             "It will not convert missing guidance into a neutral 50/100 management score. "
             "Upload an annual report, investor presentation or earnings-call transcript "
             "to extract company-specific guidance, capex, order-book and outlook evidence."
@@ -1328,7 +1328,7 @@ def source_links(sec):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V3.0.1")
+st.title("📊 Indian Stock Intelligence — V3.1")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -1358,10 +1358,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V3.0.1 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V3.1 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.0.1 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.1 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -1371,7 +1371,7 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V3.0.1 coverage")
+    st.markdown("### V3.1 coverage")
     st.markdown("- NSE Main Board + NSE Emerge / SME")
     st.markdown("- BSE Main Board + BSE SME")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
@@ -1379,7 +1379,7 @@ if not run:
     st.markdown("- Fundamentals and valuation can continue even if technical history is unavailable")
     st.markdown("- Optional annual-report / investor-presentation / transcript evidence extraction")
     st.caption(
-        "V3.0.1 separates security identity, market-data availability and research evidence. "
+        "V3.1 separates security identity, market-data availability and research evidence. "
         "Technical analysis is optional; research analysis can continue when OHLCV is unavailable."
     )
     st.stop()
@@ -1807,7 +1807,7 @@ try:
 
     st.divider()
     st.caption(
-    "V3.0.1 is an analytical prototype, not investment advice. No broker account is required. "
+    "V3.1 is an analytical prototype, not investment advice. No broker account is required. "
     "Exchange identity is kept separate from market-data availability; public data can still be incomplete, "
     "especially for SME securities. Verify material decisions against exchange/company filings."
 )
