@@ -611,6 +611,89 @@ def _clean_yf_history(hist):
     return h.dropna(subset=["Close"]).sort_index()
 
 
+
+def _safe_stmt(ticker, method_name, freq):
+    """Fetch one financial statement family without allowing one failure to break the others."""
+    try:
+        fn = getattr(ticker, method_name)
+        df = fn(freq=freq)
+        return normalize_statement(df)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _safe_ticker_info(ticker):
+    """Get Yahoo structured metadata with a fast_info fallback."""
+    info = {}
+    try:
+        raw = ticker.info
+        if isinstance(raw, dict):
+            info.update(raw)
+    except Exception:
+        pass
+
+    try:
+        fi = ticker.fast_info
+        for key in ["last_price", "market_cap", "shares", "currency"]:
+            try:
+                value = fi.get(key) if hasattr(fi, "get") else fi[key]
+            except Exception:
+                value = None
+
+            if value is None:
+                continue
+
+            if key == "last_price":
+                info.setdefault("currentPrice", safe_num(value))
+                info.setdefault("regularMarketPrice", safe_num(value))
+            elif key == "market_cap":
+                info.setdefault("marketCap", safe_num(value))
+            elif key == "shares":
+                info.setdefault("sharesOutstanding", safe_num(value))
+            elif key == "currency":
+                info.setdefault("currency", value)
+    except Exception:
+        pass
+
+    return info
+
+
+def _merge_quote_into_info(info, sec):
+    """Use the exchange quote as the preferred current-price source."""
+    info = dict(info or {})
+    exchange = str(sec.get("exchange", "")).upper()
+
+    try:
+        if exchange == "NSE":
+            quote = nse_quote(str(sec.get("symbol", "")))
+            if quote.get("lastPrice") is not None and not pd.isna(quote["lastPrice"]):
+                info["currentPrice"] = quote["lastPrice"]
+                info["regularMarketPrice"] = quote["lastPrice"]
+            if quote.get("previousClose") is not None:
+                info["previousClose"] = quote["previousClose"]
+            if quote.get("dayHigh") is not None:
+                info["dayHigh"] = quote["dayHigh"]
+            if quote.get("dayLow") is not None:
+                info["dayLow"] = quote["dayLow"]
+
+        elif exchange == "BSE" and sec.get("bse_code"):
+            quote = bse_quote(str(sec["bse_code"]))
+            if quote.get("LTP") is not None and not pd.isna(quote["LTP"]):
+                info["currentPrice"] = quote["LTP"]
+                info["regularMarketPrice"] = quote["LTP"]
+            if quote.get("PrevClose") is not None:
+                info["previousClose"] = quote["PrevClose"]
+            if quote.get("High") is not None:
+                info["dayHigh"] = quote["High"]
+            if quote.get("Low") is not None:
+                info["dayLow"] = quote["Low"]
+    except Exception:
+        # Exchange quote failure should never stop the research engine.
+        pass
+
+    return info
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(sec):
     """V3.0 exchange-first data layer.
