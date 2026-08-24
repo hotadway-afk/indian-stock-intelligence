@@ -15,7 +15,7 @@ except Exception:
     PdfReader = None
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V3.2",
+    page_title="Indian Stock Intelligence V3.2.1",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -761,6 +761,10 @@ def load_stock(sec):
     ])
     if pd.isna(safe_num(info.get("sharesOutstanding"))) and not pd.isna(shares_from_stmt):
         info["sharesOutstanding"] = shares_from_stmt
+
+    # News is optional. Initialize before the API call so a ticker that has
+    # no news / a provider error never crashes the entire analysis.
+    news = []
     try:
         raw_news = ticker.news or []
         for item in raw_news[:20]:
@@ -772,7 +776,12 @@ def load_stock(sec):
                 pub = content.get("pubDate") or item.get("providerPublishTime")
             else:
                 title = item.get("title"); publisher = item.get("publisher"); url = item.get("link"); pub = item.get("providerPublishTime")
-            news.append({"title": title, "publisher": publisher, "url": url, "published": pub})
+            news.append({
+                "title": title or "",
+                "publisher": publisher or "",
+                "url": url or "",
+                "published": pub or "",
+            })
     except Exception:
         news = []
 
@@ -1470,7 +1479,7 @@ def source_links(sec):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V3.2")
+st.title("📊 Indian Stock Intelligence — V3.2.1")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -1500,10 +1509,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V3.2 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V3.2.1 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.2 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.2.1 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -1668,7 +1677,7 @@ try:
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
         if sec.get("segment_note"): st.warning(sec.get("segment_note"))
-        st.caption("Exchange identity is authoritative. V3.2 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
+        st.caption("Exchange identity is authoritative. V3.2.1 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -1967,7 +1976,7 @@ try:
 
     st.divider()
     st.caption(
-    "V3.2 is an analytical prototype, not investment advice. No broker account is required. "
+    "V3.2.1 is an analytical prototype, not investment advice. No broker account is required. "
     "Exchange identity is kept separate from market-data availability; public data can still be incomplete, "
     "especially for SME securities. Verify material decisions against exchange/company filings."
 )
