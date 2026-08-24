@@ -15,7 +15,7 @@ except Exception:
     PdfReader = None
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V3.1",
+    page_title="Indian Stock Intelligence V3.2",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -113,15 +113,27 @@ def latest_row(df, names):
 def find_row(df, candidates):
     if df is None or df.empty:
         return None
-    lower = {str(i).lower(): i for i in df.index}
+
+    def norm(s):
+        return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+    rows = list(df.index)
+    normalized = {norm(r): r for r in rows}
+
+    # Exact normalized match.
     for c in candidates:
-        if c.lower() in lower:
-            return lower[c.lower()]
-    for i in df.index:
-        s = str(i).lower()
+        nc = norm(c)
+        if nc in normalized:
+            return normalized[nc]
+
+    # Flexible contains match, but avoid ambiguous ultra-short candidates.
+    for r in rows:
+        nr = norm(r)
         for c in candidates:
-            if c.lower() in s:
-                return i
+            nc = norm(c)
+            if len(nc) >= 6 and (nc in nr or nr in nc):
+                return r
+
     return None
 
 
@@ -646,24 +658,26 @@ def load_stock(sec):
     elif history_period == "—":
         history_period = "5y"
 
-    info = {}
-    annual_income = quarterly_income = annual_balance = quarterly_balance = annual_cashflow = quarterly_cashflow = pd.DataFrame()
-    news = []
+    # Fundamentals are fetched independently so one failed yfinance endpoint
+    # does not erase the other statement families.
+    info = _safe_ticker_info(ticker)
+    annual_income = _safe_stmt(ticker, "get_income_stmt", "yearly")
+    quarterly_income = _safe_stmt(ticker, "get_income_stmt", "quarterly")
+    annual_balance = _safe_stmt(ticker, "get_balance_sheet", "yearly")
+    quarterly_balance = _safe_stmt(ticker, "get_balance_sheet", "quarterly")
+    annual_cashflow = _safe_stmt(ticker, "get_cash_flow", "yearly")
+    quarterly_cashflow = _safe_stmt(ticker, "get_cash_flow", "quarterly")
 
-    # yfinance is used for structured fundamentals only when available; exchange identity stays authoritative.
-    try:
-        info = dict(ticker.info or {})
-    except Exception:
-        info = {}
-    try:
-        annual_income = normalize_statement(ticker.get_income_stmt(freq="yearly"))
-        quarterly_income = normalize_statement(ticker.get_income_stmt(freq="quarterly"))
-        annual_balance = normalize_statement(ticker.get_balance_sheet(freq="yearly"))
-        quarterly_balance = normalize_statement(ticker.get_balance_sheet(freq="quarterly"))
-        annual_cashflow = normalize_statement(ticker.get_cash_flow(freq="yearly"))
-        quarterly_cashflow = normalize_statement(ticker.get_cash_flow(freq="quarterly"))
-    except Exception:
-        pass
+    # Exchange quote is used for the current price whenever available.
+    info = _merge_quote_into_info(info, sec)
+
+    # Derive shares from statement rows when provider metadata is absent.
+    shares_from_stmt = first_available([
+        statement_latest(annual_income, ["Ordinary Shares Number", "Common Stock Shares Outstanding", "Share Issued"]),
+        statement_latest(quarterly_income, ["Ordinary Shares Number", "Common Stock Shares Outstanding", "Share Issued"]),
+    ])
+    if pd.isna(safe_num(info.get("sharesOutstanding"))) and not pd.isna(shares_from_stmt):
+        info["sharesOutstanding"] = shares_from_stmt
     try:
         raw_news = ticker.news or []
         for item in raw_news[:20]:
@@ -783,7 +797,7 @@ def technical_engine(hist):
 
 
 # -----------------------------
-# V3.1 robust financial helpers
+# V3.2 robust financial helpers
 # -----------------------------
 
 def _period_columns(df):
@@ -877,15 +891,19 @@ def get_price(info, hist):
     return np.nan
 
 
-def get_shares(info, annual_income=None, annual_balance=None):
-    for key in ["sharesOutstanding", "impliedSharesOutstanding", "floatShares"]:
+def get_shares(info, annual_income=None, annual_balance=None, quarterly_income=None):
+    for key in [
+        "sharesOutstanding", "impliedSharesOutstanding",
+        "floatShares", "sharesIssued", "shares"
+    ]:
         v = safe_num(info.get(key))
         if not pd.isna(v) and v > 0:
             return v
-    for df in [annual_income, annual_balance]:
+
+    for df in [annual_income, quarterly_income, annual_balance]:
         row = find_row(df, [
-            "Ordinary Shares Number", "Share Issued",
-            "Diluted Average Shares", "Basic Average Shares",
+            "Ordinary Shares Number", "Common Stock Shares Outstanding",
+            "Share Issued", "Diluted Average Shares", "Basic Average Shares",
             "Common Stock Shares Outstanding"
         ])
         if row is not None:
@@ -905,9 +923,11 @@ def data_availability_score(fundamental, valuation, technical_score, management)
         "ROE": not pd.isna(fundamental.get("roe")),
         "Leverage": not pd.isna(fundamental.get("de")),
         "FCF": not pd.isna(fundamental.get("fcf")),
-        "Valuation": valuation.get("available_metrics", 0) >= 1,
+        "Valuation": valuation.get("available_metrics", 0) >= 2,
         "Technical": not pd.isna(technical_score),
-        "Evidence": management.get("score", 0) > 25,
+        # Missing uploaded management docs should not make an otherwise good company
+        # look "data incomplete" in the same way as missing financial statements.
+        "Evidence layer": management.get("score", 0) > 0,
     }
     score = round(100 * sum(checks.values()) / len(checks))
     return score, checks
@@ -944,16 +964,16 @@ def fundamental_engine(info, annual_income, annual_balance, annual_cashflow,
     ebit = first_available([ebit_a, ebit_ttm])
 
     debt = first_available([
-        statement_latest(annual_balance, ["Total Debt", "Total Debt And Capital Lease Obligation"]),
-        statement_latest(quarterly_balance, ["Total Debt", "Total Debt And Capital Lease Obligation"])
+        statement_latest(annual_balance, ["Total Debt", "Total Debt And Capital Lease Obligation", "Long Term Debt And Capital Lease Obligation", "Current Debt"]),
+        statement_latest(quarterly_balance, ["Total Debt", "Total Debt And Capital Lease Obligation", "Long Term Debt And Capital Lease Obligation", "Current Debt"])
     ])
     equity = first_available([
-        statement_latest(annual_balance, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]),
-        statement_latest(quarterly_balance, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"])
+        statement_latest(annual_balance, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest", "Total Equity", "Shareholders Equity"]),
+        statement_latest(quarterly_balance, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest", "Total Equity", "Shareholders Equity"])
     ])
     cash = first_available([
-        statement_latest(annual_balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"]),
-        statement_latest(quarterly_balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
+        statement_latest(annual_balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"]),
+        statement_latest(quarterly_balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"])
     ])
     assets = first_available([
         statement_latest(annual_balance, ["Total Assets"]),
@@ -971,8 +991,8 @@ def fundamental_engine(info, annual_income, annual_balance, annual_cashflow,
         ])
     ])
     capex = first_available([
-        statement_latest(annual_cashflow, ["Capital Expenditure", "Capital Expenditures"]),
-        statement_ttm(quarterly_cashflow, ["Capital Expenditure", "Capital Expenditures"])
+        statement_latest(annual_cashflow, ["Capital Expenditure", "Capital Expenditures", "Purchase Of Property Plant And Equipment"]),
+        statement_ttm(quarterly_cashflow, ["Capital Expenditure", "Capital Expenditures", "Purchase Of Property Plant And Equipment"])
     ])
     fcf = np.nan
     if not pd.isna(operating_cf) and not pd.isna(capex):
@@ -1022,16 +1042,33 @@ def fundamental_engine(info, annual_income, annual_balance, annual_cashflow,
         "de": de,
         "cfo_pat": cfo_pat,
         "available_metrics": len(usable),
+        "annual_income": annual_income,
+        "annual_balance": annual_balance,
+        "quarterly_income": quarterly_income,
+        "quarterly_balance": quarterly_balance,
     }
 
 
 def valuation_engine(info, fundamental, hist=None):
     hist = hist if hist is not None else pd.DataFrame()
+
+    # Current price: exchange quote first, then local OHLCV.
     price = get_price(info, hist)
-    shares = get_shares(info)
+
+    shares = get_shares(
+        info,
+        fundamental.get("annual_income"),
+        fundamental.get("annual_balance"),
+        fundamental.get("quarterly_income"),
+    )
+
     market_cap = safe_num(info.get("marketCap"))
     if pd.isna(market_cap) and not pd.isna(price) and not pd.isna(shares):
         market_cap = price * shares
+
+    # Additional provider fields if available.
+    if pd.isna(market_cap):
+        market_cap = safe_num(info.get("enterpriseValue"))
 
     net_income = fundamental.get("net_income")
     revenue = fundamental.get("revenue")
@@ -1040,20 +1077,39 @@ def valuation_engine(info, fundamental, hist=None):
     debt = fundamental.get("debt")
     cash = fundamental.get("cash")
 
-    pe = (market_cap / net_income) if not pd.isna(market_cap) and not pd.isna(net_income) and net_income > 0 else safe_num(info.get("trailingPE"))
-    pb = (market_cap / equity) if not pd.isna(market_cap) and not pd.isna(equity) and equity > 0 else safe_num(info.get("priceToBook"))
-    ps = (market_cap / revenue) if not pd.isna(market_cap) and not pd.isna(revenue) and revenue > 0 else safe_num(info.get("priceToSalesTrailing12Months"))
+    pe = (
+        market_cap / net_income
+        if not pd.isna(market_cap) and not pd.isna(net_income) and net_income > 0
+        else safe_num(info.get("trailingPE"))
+    )
+    pb = (
+        market_cap / equity
+        if not pd.isna(market_cap) and not pd.isna(equity) and equity > 0
+        else safe_num(info.get("priceToBook"))
+    )
+    ps = (
+        market_cap / revenue
+        if not pd.isna(market_cap) and not pd.isna(revenue) and revenue > 0
+        else safe_num(info.get("priceToSalesTrailing12Months"))
+    )
 
     ev = np.nan
     if not pd.isna(market_cap):
         ev = market_cap + (debt if not pd.isna(debt) else 0)
         ev -= (cash if not pd.isna(cash) else 0)
 
-    ev_ebitda = (ev / ebitda) if not pd.isna(ev) and not pd.isna(ebitda) and ebitda > 0 else safe_num(info.get("enterpriseToEbitda"))
+    ev_ebitda = (
+        ev / ebitda
+        if not pd.isna(ev) and not pd.isna(ebitda) and ebitda > 0
+        else safe_num(info.get("enterpriseToEbitda"))
+    )
+
     forward_pe = safe_num(info.get("forwardPE"))
     peg = safe_num(info.get("pegRatio"))
-    if pd.isna(peg) and not pd.isna(pe) and not pd.isna(fundamental.get("earnings_growth")) and fundamental["earnings_growth"] > 0:
-        peg = pe / (fundamental["earnings_growth"] * 100)
+    if pd.isna(peg) and not pd.isna(pe):
+        eg = fundamental.get("earnings_growth")
+        if not pd.isna(eg) and eg > 0:
+            peg = pe / (eg * 100)
 
     metrics = {
         "P/E": pe,
@@ -1063,19 +1119,20 @@ def valuation_engine(info, fundamental, hist=None):
         "EV/EBITDA": ev_ebitda,
         "P/S": ps,
     }
+
     parts = {}
+    bounds = {
+        "P/E": (10, 60),
+        "Forward P/E": (8, 50),
+        "PEG": (0.5, 3),
+        "P/B": (1, 10),
+        "EV/EBITDA": (5, 35),
+        "P/S": (0.5, 8),
+    }
     for name, value in metrics.items():
-        if pd.isna(value):
-            continue
-        bounds = {
-            "P/E": (10, 60),
-            "Forward P/E": (8, 50),
-            "PEG": (0.5, 3),
-            "P/B": (1, 10),
-            "EV/EBITDA": (5, 35),
-            "P/S": (0.5, 8),
-        }[name]
-        parts[name] = score_range(value, bounds[0], bounds[1], True)
+        if not pd.isna(value):
+            lo, hi = bounds[name]
+            parts[name] = score_range(value, lo, hi, True)
 
     return {
         "score": float(np.mean(list(parts.values()))) if parts else 50.0,
@@ -1089,6 +1146,8 @@ def valuation_engine(info, fundamental, hist=None):
         "market_cap": market_cap,
         "enterprise_value": ev,
         "available_metrics": len(parts),
+        "price": price,
+        "shares": shares,
     }
 
 
@@ -1300,7 +1359,7 @@ def management_evidence_engine(sec, info, docs):
         "findings": findings,
         "guidance": "Needs document verification",
         "note": (
-            "V3.1 separates evidence availability from management quality. "
+            "V3.2 separates evidence availability from management quality. "
             "It will not convert missing guidance into a neutral 50/100 management score. "
             "Upload an annual report, investor presentation or earnings-call transcript "
             "to extract company-specific guidance, capex, order-book and outlook evidence."
@@ -1328,7 +1387,7 @@ def source_links(sec):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V3.1")
+st.title("📊 Indian Stock Intelligence — V3.2")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -1358,10 +1417,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V3.1 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V3.2 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.1 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.2 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -1371,7 +1430,7 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V3.1 coverage")
+    st.markdown("### V3.2 coverage")
     st.markdown("- NSE Main Board + NSE Emerge / SME")
     st.markdown("- BSE Main Board + BSE SME")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
@@ -1379,7 +1438,7 @@ if not run:
     st.markdown("- Fundamentals and valuation can continue even if technical history is unavailable")
     st.markdown("- Optional annual-report / investor-presentation / transcript evidence extraction")
     st.caption(
-        "V3.1 separates security identity, market-data availability and research evidence. "
+        "V3.2 separates security identity, market-data availability and research evidence. "
         "Technical analysis is optional; research analysis can continue when OHLCV is unavailable."
     )
     st.stop()
@@ -1526,7 +1585,7 @@ try:
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
         if sec.get("segment_note"): st.warning(sec.get("segment_note"))
-        st.caption("Exchange identity is authoritative. V3.0 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
+        st.caption("Exchange identity is authoritative. V3.2 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -1692,6 +1751,17 @@ try:
             hide_index=True
         )
         st.markdown(f"**Valuation score: {valuation['score']:.0f}/100**")
+        missing_val = [k for k,v in {
+            "Trailing P/E": valuation["pe"],
+            "Forward P/E": valuation["forward_pe"],
+            "PEG": valuation["peg"],
+            "P/B": valuation["pb"],
+            "EV/EBITDA": valuation["ev_ebitda"],
+            "P/S": valuation["ps"],
+        }.items() if pd.isna(v)]
+        if missing_val:
+            st.caption("Unavailable valuation fields: " + ", ".join(missing_val) +
+                       ". Forward metrics require provider estimates; other gaps usually indicate missing shares/price/statement inputs.")
         st.bar_chart(pd.Series(valuation["parts"], name="Valuation score", dtype="float64"))
         st.caption("Relative valuation is calculated from available price + financial-statement data. Missing forward metrics remain explicitly unavailable.")
 
@@ -1769,6 +1839,13 @@ try:
             "Universe source": sec.get("source"),
         }]), use_container_width=True, hide_index=True)
 
+        st.markdown("### Market snapshot")
+        a,b,c,d = st.columns(4)
+        a.metric("Current price", fmt_num(valuation.get("price")))
+        b.metric("Shares", fmt_num(valuation.get("shares")))
+        c.metric("Market cap", fmt_num(valuation.get("market_cap")))
+        d.metric("Enterprise value", fmt_num(valuation.get("enterprise_value")))
+
         st.markdown("### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -1807,7 +1884,7 @@ try:
 
     st.divider()
     st.caption(
-    "V3.1 is an analytical prototype, not investment advice. No broker account is required. "
+    "V3.2 is an analytical prototype, not investment advice. No broker account is required. "
     "Exchange identity is kept separate from market-data availability; public data can still be incomplete, "
     "especially for SME securities. Verify material decisions against exchange/company filings."
 )
