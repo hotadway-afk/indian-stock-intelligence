@@ -15,14 +15,14 @@ except Exception:
     PdfReader = None
 
 st.set_page_config(
-    page_title="Indian Stock Intelligence V3.2.1",
+    page_title="Indian Stock Intelligence V3.3",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ============================================================
-# V3.0: Exchange-first market-data architecture
+# V3.3: Exchange-first market-data architecture
 # NSE + BSE + NSE Emerge + BSE SME security resolver
 # Market-data priority: NSE/BSE exchange data -> optional yfinance fallback.
 # Coverage targets:
@@ -329,7 +329,7 @@ def resolve_security(query,exchange_choice,universe):
         matches=matches.sort_values("_rank",ascending=False).drop(columns="_rank")
         return matches.iloc[0].to_dict(),matches.head(25)
 
-    # Critical V3.0 change: direct BSE resolution is attempted even when the
+    # Critical V3.3 change: direct BSE resolution is attempted even when the
     # bulk BSE universe is empty. This prevents provider/master failures from
     # being misreported as "unlisted".
     if exchange_choice in ("All Exchanges","BSE","BSE SME"):
@@ -345,7 +345,7 @@ def resolve_security(query,exchange_choice,universe):
 
 
 def yahoo_ticker_for(sec):
-    """Legacy fallback ticker only. Exchange data is preferred in V3.0."""
+    """Legacy fallback ticker only. Exchange data is preferred in V3.3."""
     exchange = str(sec.get("exchange", "NSE")).upper()
     symbol = str(sec.get("symbol", "")).strip().upper()
     code = str(sec.get("bse_code", "")).strip()
@@ -694,9 +694,173 @@ def _merge_quote_into_info(info, sec):
     return info
 
 
+
+# -----------------------------
+# V3.3 public-financial-data adapters
+# -----------------------------
+
+def _html_tables(url):
+    """Best-effort HTML table loader. Returns [] on blocked/error pages."""
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/151 Safari/537.36"
+                ),
+                "Accept-Language": "en-IN,en;q=0.9",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        if "captcha" in r.text.lower() or "access denied" in r.text.lower():
+            return []
+        return pd.read_html(r.text)
+    except Exception:
+        return []
+
+
+def _normalise_financial_table(df):
+    """Convert a public financial table into the model's row-indexed format."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    x = df.copy()
+    if isinstance(x.columns, pd.MultiIndex):
+        x.columns = [
+            " ".join([str(v) for v in col if str(v).lower() != "nan"]).strip()
+            for col in x.columns
+        ]
+
+    # Find likely label column.
+    label_col = x.columns[0]
+    x = x.copy()
+    x[label_col] = x[label_col].astype(str).str.strip()
+    x = x[x[label_col].notna()]
+    x = x.set_index(label_col)
+
+    # Convert numeric-looking values.
+    for c in x.columns:
+        x[c] = pd.to_numeric(
+            x[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+            errors="coerce"
+        )
+
+    return x
+
+
+def _find_table_with(df_list, phrases):
+    for df in df_list:
+        if df is None or df.empty:
+            continue
+        joined = " ".join(str(v) for v in df.astype(str).iloc[:, :3].to_numpy().flatten())
+        low = joined.lower()
+        if any(p.lower() in low for p in phrases):
+            return _normalise_financial_table(df)
+    return pd.DataFrame()
+
+
+def _parse_screener_page(sec):
+    """
+    Public Screener fallback.
+    Screener exposes annual/quarterly P&L, balance sheet, cash flow and
+    a compact ratio header for many Indian listed securities, including SME.
+    It is used only when the primary structured provider is missing data.
+    """
+    symbol = str(sec.get("symbol") or "").strip().upper()
+    code = str(sec.get("bse_code") or "").strip()
+    candidates = []
+
+    if code and code not in {"NAN", "NONE"}:
+        candidates.append(f"https://www.screener.in/company/{code}/")
+    if symbol:
+        candidates.append(f"https://www.screener.in/company/{symbol}/")
+
+    for url in candidates:
+        tables = _html_tables(url)
+        if not tables:
+            continue
+
+        income = _find_table_with(tables, ["Sales", "Net Profit", "Profit before tax"])
+        balance = _find_table_with(tables, ["Equity Capital", "Reserves", "Borrowings", "Total Assets"])
+        cash = _find_table_with(tables, ["Cash from Operating Activity", "Cash from Investing Activity", "Cash from Financing Activity"])
+
+        # Header metrics can be extracted from the HTML text using a lightweight regex.
+        try:
+            r = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=20,
+            )
+            html = r.text
+        except Exception:
+            html = ""
+
+        metrics = {}
+        patterns = {
+            "marketCap": r"Market Cap[^₹0-9]*₹\s*([0-9,.]+)\s*Cr",
+            "currentPrice": r"Current Price[^₹0-9]*₹\s*([0-9,.]+)",
+            "trailingPE": r"Stock P/E[^0-9]*([0-9,.]+)",
+            "returnOnEquity": r"ROE[^0-9]*([0-9,.]+)%",
+            "returnOnAssets": r"ROA[^0-9]*([0-9,.]+)%",
+            "returnOnCapital": r"ROCE[^0-9]*([0-9,.]+)%",
+            "priceToBook": r"Book Value[^₹0-9]*₹\s*([0-9,.]+)",
+        }
+        for key, pat in patterns.items():
+            m = re.search(pat, html, re.I | re.S)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", ""))
+                    metrics[key] = val * 1e7 if key == "marketCap" else val
+                except Exception:
+                    pass
+
+        return {
+            "url": url,
+            "income": income,
+            "balance": balance,
+            "cashflow": cash,
+            "metrics": metrics,
+            "source": "Screener public fallback",
+        }
+
+    return {
+        "url": "",
+        "income": pd.DataFrame(),
+        "balance": pd.DataFrame(),
+        "cashflow": pd.DataFrame(),
+        "metrics": {},
+        "source": "",
+    }
+
+
+def _merge_statement_missing(primary, fallback):
+    """Fill missing rows in the primary statement from fallback."""
+    if primary is None or primary.empty:
+        return fallback.copy() if fallback is not None else pd.DataFrame()
+    if fallback is None or fallback.empty:
+        return primary.copy()
+
+    out = primary.copy()
+    for row in fallback.index:
+        if row not in out.index:
+            out.loc[row] = fallback.loc[row]
+    return out
+
+
+def _merge_info_missing(info, fallback_metrics):
+    out = dict(info or {})
+    for k, v in (fallback_metrics or {}).items():
+        if v is None:
+            continue
+        if pd.isna(safe_num(out.get(k))):
+            out[k] = v
+    return out
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(sec):
-    """V3.0 exchange-first data layer.
+    """V3.3 exchange-first data layer.
 
     Priority for OHLCV:
       1) NSE public historical API for NSE / NSE Emerge
@@ -750,6 +914,16 @@ def load_stock(sec):
     quarterly_balance = _safe_stmt(ticker, "get_balance_sheet", "quarterly")
     annual_cashflow = _safe_stmt(ticker, "get_cash_flow", "yearly")
     quarterly_cashflow = _safe_stmt(ticker, "get_cash_flow", "quarterly")
+
+    # V3.3: if yfinance is sparse (common for smaller BSE/SME names),
+    # try a public Indian financial-data fallback. This is supplemental
+    # and never overrides an already-populated primary statement field.
+    public_fin = _parse_screener_page(sec)
+    if public_fin["source"]:
+        annual_income = _merge_statement_missing(annual_income, public_fin["income"])
+        annual_balance = _merge_statement_missing(annual_balance, public_fin["balance"])
+        annual_cashflow = _merge_statement_missing(annual_cashflow, public_fin["cashflow"])
+        info = _merge_info_missing(info, public_fin["metrics"])
 
     # Exchange quote is used for the current price whenever available.
     info = _merge_quote_into_info(info, sec)
@@ -811,6 +985,7 @@ def load_stock(sec):
     info["providerTicker"] = ticker_symbol
     info["dataProvider"] = provider
     info["providerChain"] = " → ".join(provider_chain)
+    info["financialDataProvider"] = public_fin["source"] or ("yfinance" if not annual_income.empty else "Unavailable")
     info["historyPeriod"] = history_period
     info["dataQuality"] = "HIGH" if provider in {"NSE public API", "BSE public data"} and len(hist) >= 200 else ("MEDIUM" if not hist.empty else "LOW")
 
@@ -889,7 +1064,7 @@ def technical_engine(hist):
 
 
 # -----------------------------
-# V3.2 robust financial helpers
+# V3.3 robust financial helpers
 # -----------------------------
 
 def _period_columns(df):
@@ -1304,7 +1479,7 @@ def quality_engine(info, fundamental):
 
 
 # -----------------------------
-# V3.0 management / evidence engine
+# V3.3 management / evidence engine
 # -----------------------------
 
 EVIDENCE_KEYWORDS = {
@@ -1451,7 +1626,7 @@ def management_evidence_engine(sec, info, docs):
         "findings": findings,
         "guidance": "Needs document verification",
         "note": (
-            "V3.2 separates evidence availability from management quality. "
+            "V3.3 separates evidence availability from management quality. "
             "It will not convert missing guidance into a neutral 50/100 management score. "
             "Upload an annual report, investor presentation or earnings-call transcript "
             "to extract company-specific guidance, capex, order-book and outlook evidence."
@@ -1479,7 +1654,7 @@ def source_links(sec):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Indian Stock Intelligence — V3.2.1")
+st.title("📊 Indian Stock Intelligence — V3.3")
 st.caption("Exchange-first NSE + BSE + NSE Emerge + BSE SME Fundamental + Evidence + Valuation + Technical + Risk engine")
 
 universe = load_universe()
@@ -1491,7 +1666,7 @@ with st.sidebar:
     st.subheader("📄 Evidence / filing documents")
     st.caption(
         "Optional: upload an annual report, investor presentation, earnings-call transcript "
-        "or other company filing. V3.0 searches the documents for guidance, capex, order book, "
+        "or other company filing. V3.3 searches the documents for guidance, capex, order book, "
         "demand, margin and risk evidence."
     )
     uploaded = st.file_uploader(
@@ -1509,10 +1684,10 @@ with st.sidebar:
     capital = st.number_input("Portfolio capital (₹)", min_value=10000, value=500000, step=10000)
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     objective = st.selectbox("Primary objective", ["Long Term", "Swing Trading", "Intraday"])
-    run = st.button("🚀 RUN V3.2.1 ANALYSIS", type="primary", use_container_width=True)
+    run = st.button("🚀 RUN V3.3 ANALYSIS", type="primary", use_container_width=True)
 
 if not run:
-    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.2.1 ANALYSIS.")
+    st.info("Enter a symbol, BSE code, ISIN or company name and click RUN V3.3 ANALYSIS.")
     a,b,c,d = st.columns(4)
     nse_count = len(universe[universe.exchange == "NSE"]) if not universe.empty else 0
     bse_count = len(universe[universe.exchange == "BSE"]) if not universe.empty else 0
@@ -1522,7 +1697,7 @@ if not run:
     b.metric("BSE universe", f"{bse_count:,}")
     c.metric("NSE Emerge / SME", f"{nse_sme:,}")
     d.metric("BSE SME", f"{bse_sme:,}")
-    st.markdown("### V3.2 coverage")
+    st.markdown("### V3.3 coverage")
     st.markdown("- NSE Main Board + NSE Emerge / SME")
     st.markdown("- BSE Main Board + BSE SME")
     st.markdown("- Symbol, BSE scrip code, ISIN and company-name lookup")
@@ -1530,7 +1705,7 @@ if not run:
     st.markdown("- Fundamentals and valuation can continue even if technical history is unavailable")
     st.markdown("- Optional annual-report / investor-presentation / transcript evidence extraction")
     st.caption(
-        "V3.2 separates security identity, market-data availability and research evidence. "
+        "V3.3 separates security identity, market-data availability and research evidence. "
         "Technical analysis is optional; research analysis can continue when OHLCV is unavailable."
     )
     st.stop()
@@ -1582,8 +1757,11 @@ try:
         data = load_stock(sec)
 
     hist = data["hist"]; info = data["info"]
+    if info.get("financialDataProvider") == "Screener public fallback":
+        st.info("Financial statements were supplemented with a public Indian financial-data source because the primary provider returned incomplete statement data.")
 
-    # V3.0: technicals are optional. A company can still receive a research
+
+    # V3.3: technicals are optional. A company can still receive a research
     # report when OHLCV history is unavailable.
     if hist.empty:
         tech = hist
@@ -1677,7 +1855,7 @@ try:
         id1,id2,id3,id4=st.columns(4)
         id1.metric("Exchange",str(sec.get("exchange") or "N/A")); id2.metric("Segment",str(sec.get("segment") or "N/A")); id3.metric("BSE code",str(sec.get("bse_code") or "N/A")); id4.metric("ISIN",str(sec.get("isin") or "N/A"))
         if sec.get("segment_note"): st.warning(sec.get("segment_note"))
-        st.caption("Exchange identity is authoritative. V3.2.1 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
+        st.caption("Exchange identity is authoritative. V3.3 attempts NSE/BSE exchange data first; yfinance remains a legacy fallback only. Missing provider history is never treated as proof of an unlisted security.")
         st.markdown("#### Market-data provenance")
         st.write({
             "Primary provider used": data.get("provider"),
@@ -1688,7 +1866,7 @@ try:
         })
 
     cols=st.columns(6)
-    cols[0].metric("V3.0 Score", f"{overall:.0f}/100")
+    cols[0].metric("V3.3 Score", f"{overall:.0f}/100")
     cols[1].metric("Fundamental", f"{fundamental['score']:.0f}")
     cols[2].metric("Evidence", f"{management['score']:.0f}")
     cols[3].metric("Valuation", f"{valuation['score']:.0f}")
@@ -1819,6 +1997,10 @@ try:
         else:
             st.warning("No company-specific documents were uploaded in this session.")
 
+        st.markdown("### Public research sources")
+        for label, url in source_links(sec):
+            st.markdown(f"- [{label}]({url})")
+
         st.markdown("### Guidance tracker")
         st.write("FY27 revenue guidance: " + str(management.get("guidance", "Not verified")))
         st.write("FY27 EBITDA / margin guidance: Not verified unless supported by company evidence.")
@@ -1865,7 +2047,7 @@ try:
                 "providers returned no reliable OHLCV history for this security."
             )
             st.info(
-                "V3.0 continues with fundamentals, valuation, risk flags and evidence analysis. "
+                "V3.3 continues with fundamentals, valuation, risk flags and evidence analysis. "
                 "Technical score is excluded from the overall score when OHLCV is unavailable."
             )
         else:
@@ -1940,6 +2122,12 @@ try:
 
         st.markdown("### Market-data provenance")
         st.write({
+            "Financial-data provider": info.get("financialDataProvider", "Unavailable"),
+            "Primary market-data provider": data.get("provider"),
+            "Provider chain": data.get("provider_chain"),
+        })
+
+        st.write({
             "Primary provider used": data.get("provider"),
             "Provider chain": data.get("provider_chain"),
             "Historical sessions": len(hist),
@@ -1976,7 +2164,7 @@ try:
 
     st.divider()
     st.caption(
-    "V3.2.1 is an analytical prototype, not investment advice. No broker account is required. "
+    "V3.3 is an analytical prototype, not investment advice. No broker account is required. "
     "Exchange identity is kept separate from market-data availability; public data can still be incomplete, "
     "especially for SME securities. Verify material decisions against exchange/company filings."
 )
